@@ -3,8 +3,10 @@
 
 from vllm_tt_plugin.platform import (
     _install_diffusion_gemma_architecture_patch,
+    _install_glm53_selftest_endpoint_patch,
     _install_torch_accelerator_cleanup_patch,
     _install_tt_async_spec_method_patch,
+    _install_tt_mtp_speculative_config_patch,
     _should_pre_register_tt_test_models_from_cli,
     register_tt_models,
     register_tt_test_models,
@@ -43,4 +45,11 @@ def register_tt_models_from_plugin() -> None:
     # the gate in the engine core by then. Without this, a model-owned drafter
     # launch fails upstream's async gate there after KV cache allocation.
     _install_tt_async_spec_method_patch()
+    # EngineArgs.create_engine_config reaches pre_register_and_update first,
+    # but a SpeculativeConfig built directly, outside that call, does not; it
+    # must not build an ``mtp`` draft model either.
+    _install_tt_mtp_speculative_config_patch()
     _install_torch_accelerator_cleanup_patch()
+    # The API server process loads general plugins while it builds the engine
+    # client, before build_app: the self-test hook must be in place by then.
+    _install_glm53_selftest_endpoint_patch()

@@ -178,6 +178,8 @@ def test_execute_model_defers_structured_device_sampling_until_sample_tokens():
         TTModelRunner._finish_front_packed_sync,
         runner,
     )
+    # execute_model wraps the step meter around _execute_model_impl, which does the work
+    runner._execute_model_impl = partial(TTModelRunner._execute_model_impl, runner)
 
     assert TTModelRunner.execute_model(runner, SimpleNamespace()) is None
     assert events == ["build-without-grammar", "drain", "forward"]

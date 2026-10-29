@@ -320,9 +320,11 @@ class TestFrequencyPenalty:
         no_penalty = [results[i] for i in range(0, max_batch_size, 2)]
         with_penalty = [results[i] for i in range(1, max_batch_size, 2)]
 
-        # Count "a"s in each output
-        no_penalty_a_count = no_penalty[0].count("a")
-        with_penalty_a_count = with_penalty[0].count("a")
+        # Count the repeated unit as whole words: the frequency penalty acts on repeated TOKENS, so a penalized model
+        # escapes " a" through other tokens that may still contain the letter ("aa", "aaa"; GLM-5.3-Flash at 64K,
+        # 2026-10-22: " a"x15 vs " a a\n\na a a\n\na\na\naa aa aaa aaa" -- 15 vs 17 letters, 15 vs 8 words)
+        no_penalty_a_count = no_penalty[0].split().count("a")
+        with_penalty_a_count = with_penalty[0].split().count("a")
 
         assert no_penalty_a_count > with_penalty_a_count, (
             f"Frequency penalty should reduce 'a' repetitions: "

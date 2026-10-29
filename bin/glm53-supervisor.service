@@ -1,0 +1,31 @@
+# glm53-supervisor.service — systemd unit TEMPLATE for the GLM-5.3-Flash standing server on host-8chip.
+# Not required: the daemon runs the same way from a terminal (see the README's "serve-forever" runbook);
+# this unit only keeps it across logouts / reboots. Install as a USER unit (no sudo):
+#   mkdir -p ~/.config/systemd/user && cp glm53-supervisor.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now glm53-supervisor
+#   loginctl enable-linger alex      # once (operator; needs root on some distros) so it survives logout
+# Stop = SIGTERM to the supervisor = SIGINT to the API server once it is up, then wait (never a kill):
+# TimeoutStopSec covers vLLM's 900 s shutdown-timeout plus the image close. KillMode=none on purpose: systemd
+# must never SIGKILL a device process tree; a server that will not exit is the operator's (HUNG + escalation).
+[Unit]
+Description=GLM-5.3-Flash vLLM standing server supervisor (TP8, host-8chip)
+After=network-online.target
+# the workspace share (fabtool) must be mounted first; without it the launch is "refused" and retried every 60 s
+ConditionPathIsMountPoint=/opt/glm53/share
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/glm53/work-s9
+ExecStart=/usr/bin/python3 /opt/glm53/srv/supervisor/bin/glm53_supervisor.py --config /opt/glm53/work-s9/supervisor/supervisor.json
+Restart=on-failure
+RestartSec=30
+KillMode=none
+KillSignal=SIGTERM
+TimeoutStopSec=1200
+Environment=PYTHONUNBUFFERED=1
+# the daemon logs to <run_root>/supervisor.log itself; journal gets the same lines via stderr
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

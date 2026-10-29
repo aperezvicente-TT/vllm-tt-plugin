@@ -1522,12 +1522,12 @@ def test_a_peer_cancelled_mid_transition_leaves_the_solo_request_intact():
     assert runner.requests["solo"].output_token_ids == continuation(
         11 + PROMPT_LEN - 1, PROMPT_LEN - 1, 1
     )
-    # The drafter decided during the step that ran, when two requests were
-    # live, so it offered nothing and there is nothing to report yet. One
-    # ordinary step later the batch is solo and it offers again: a transition
-    # costs one step before speculation resumes, which is inherent to deciding
-    # at the commit of the step that produced the token.
-    assert runner.take_draft_token_ids() is None
+    # The peer finished before that step's result was applied, so at the
+    # commit the drafter is handed the solo request alone (a request the
+    # runner no longer holds is not speculable -- Stage 17, 2026-10-27) and
+    # may offer for it at once; it never offers for the finished peer.
+    first = runner.take_draft_token_ids()
+    assert first is None or first.req_ids == ["solo"]
 
     _settle_layout(runner)
     step = _submit_plain_step(runner, "solo")

@@ -24,7 +24,9 @@ ordinary single-token decoding with multi-token verification in one launch.
 The current TT path is more specialized than upstream vLLM:
 
 - A TT step is treated as either all-prefill or all-decode.
-- TT does not support mixed prefill+decode batches.
+- TT does not support mixed prefill+decode batches by default; the opt-in
+  mixed-step mode (see "Mixed prefill+decode steps") runs a step's prefill rows
+  and decode rows back to back as two device calls of one step.
 - Token-chunked prefill is supported, but only for models whose tt-metal class
   declares that its generator can resume a prefill (never for block-output
   models); a chunk continuation is prefill work and only ever runs in a prefill
@@ -340,6 +342,54 @@ advance. Every lane executes the one negotiated mode, so a per-lane decision
 would let lanes disagree. Standard multi-process DP needs nothing cross-rank:
 each rank runs the policy on its own scheduler state.
 
+### Mixed prefill+decode steps
+
+The opt-in alternative to the interleave policy: one engine step carries the
+pending prefill chunk(s) *and* one decode token for every running decode, so a
+decoding request gets a token on every step however long the other prompts
+are. Enable it with `additional_config["tt"]["mixed_prefill_decode_steps"] =
+true` or `GLM53_MIXED_STEPS=1` (the environment variable, when set to `0` or
+`1`, overrides the key). Default off.
+
+Scheduler (`TTScheduler._schedule_mixed`): when prefill work is pending and
+requests decode, the step is ONE base-scheduler pass over the running decodes,
+the partial prefills and the waiting queue, so the KV-connector metadata,
+block allocation and async placeholders are built once. The prefill part gets
+what a prefill step would, `min(GLM53_MIXED_PREFILL_CAP, step budget)`, and
+the decode rows (one token each) come on top of it, so a mixed step totals at
+most one token per decode more than `max_num_batched_tokens`: TT submits the
+two parts as separate device calls, each within the shapes of a single-kind
+step, and a prompt's chunks keep their size next to any number of decoders
+(taking the decode tokens out of the prefill's share would round a 2,048
+chunk down to 1,920 for a single decoder). `GLM53_MIXED_PREFILL_CAP` defaults
+to the normal per-step prefill limit (`max_num_scheduled_tokens`, capped by
+`long_prefill_token_threshold`) and must be at least the chunk alignment. The
+prefill rows are held to their budget in the block-aligned-split hook, before
+the usual 128-token chunk alignment, so a mixed chunk ends on the grid like
+any other. The interleave policy is not consulted for a mixed step.
+
+A step falls back to the single-kind policy when it cannot mix: a running
+request carries speculative drafts, or a live request uses min_p / logit_bias
+/ min_tokens (their logits processors index the whole persistent batch). The
+whole mode stays off for block-output models, speculative decoding, lane-DP,
+multimodal / mrope models, custom logits processors and launches without
+chunked prefill.
+
+Runner (`TTModelRunner._execute_mixed_step`): the step's batch is split into
+its prefill rows and its decode rows, built as two ordinary inputs, and
+submitted back to back (`prefill_forward`, then `decode_forward` over the
+decoding rows only; the prefilling request's slot is an inactive row there).
+Both parts are sampled in `sample_tokens` and returned as one
+`ModelRunnerOutput`: every decode row and every prefill row whose prompt ends
+this step carries a token, an intermediate chunk carries none. A mixed step is
+synchronous: outstanding async decodes are drained before it, and the next
+decode reloads its inputs from the host. Only pure decode steps keep the async
+fast path. The KV connector sees the step once: its loads serve the prefill
+rows, and `TTKVConnectorHost.wrap_finish_mixed` saves both parts. The decode
+part's state-slot gather permutes every slot, so the prefill part's saves
+(chunk checkpoints, deferred to the next step) are handed the slots the
+prefilled requests hold after the gather.
+
 ### Generic speculative decoding
 
 The generic speculative path uses `speculative_config` and a model's
@@ -355,7 +405,7 @@ The scheduler and runner divide the work as follows:
    `speculative_config.num_speculative_tokens`, so the scheduler reserves the
    admitted draft width.
 2. `TTScheduler` reserves `K+1` additional KV positions for a model-owned
-   `custom_class` drafter, where `K` is the admitted draft width. The drafter
+   `custom_class` or `mtp` drafter, where `K` is the admitted draft width. The drafter
    can write its next proposal over the committed anchor and `K` candidates.
    The host `ngram` drafter needs no additional proposal-side KV reservation.
 3. `TTModelRunner` builds a candidate block of width `1+K` when a decode step

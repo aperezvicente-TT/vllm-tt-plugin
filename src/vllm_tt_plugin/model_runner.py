@@ -7,13 +7,14 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass, fields, replace
-from functools import partial
+from functools import partial, wraps
 from typing import TYPE_CHECKING, Any, cast
 
 import regex as re
 import torch
 import ttnn
 from vllm.config import VllmConfig
+from vllm.distributed.kv_transfer import kv_transfer_state
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.tasks import GenerationTask, PoolingTask, SupportedTask
 from vllm.utils.math_utils import cdiv
@@ -53,6 +54,7 @@ from vllm_tt_plugin.config import (
 )
 from vllm_tt_plugin.host_sampler import create_host_sampler
 from vllm_tt_plugin.input_batch import (
+    LOGPROBS_NONE_SENTINEL,
     SEED_NONE_SENTINEL,
     CachedRequestState,
     InputBatch,
@@ -61,16 +63,21 @@ from vllm_tt_plugin.input_batch import (
     build_cached_request_state,
     clone_torch_generator,
 )
+from vllm_tt_plugin.kv_connector import TTKVConnectorHost
+from vllm_tt_plugin.stepmeter import get_step_meter
 from vllm_tt_plugin.lane_scheduler import get_tt_step_plan
 from vllm_tt_plugin.loader import TTModelLoader
+from vllm_tt_plugin import gc_tuning, prefill_pacer, ttft_phases
 from vllm_tt_plugin.logger import init_tt_logger
 from vllm_tt_plugin.logprobs import build_device_logprobs
 from vllm_tt_plugin.model_input import (
+    TTMixedModelInput,
     TTModelInput,
     TTSamplingParams,
     slice_tt_sampling_params,
 )
 from vllm_tt_plugin.platform import TTPlatform
+from vllm_tt_plugin.scheduler import get_tt_segment_step, is_tt_mixed_step
 from vllm_tt_plugin.spec_admission import method_requirements
 from vllm_tt_plugin.spec_decode import (
     ACCEPT_MODE_ARGMAX_IDS,
@@ -140,6 +147,54 @@ class _SyncForward:
     decode_submission: TTDecodeSubmission | None = None
     # The verify's hidden handle, for a model whose drafter consumes it.
     spec_hidden: Any | None = None
+
+
+def _merge_part_logprobs(
+    req_ids: tuple[str, ...],
+    index: dict[str, int],
+    parts: list[tuple[list[str], LogprobsTensors]],
+) -> LogprobsLists | None:
+    """One row per request of a mixed step, from its parts' logprobs.
+
+    A part samples logprobs only when one of its rows asks for them, so a row
+    of a part without logprobs keeps a zero filler row; vLLM reads a request's
+    row only when that request asked. Parts may report different widths (each
+    is ``max_num_logprobs + 1`` of its own sampler); the narrower one is
+    zero-padded, and vLLM reads no column past what the request asked for.
+    """
+    if not parts:
+        return None
+    lists = [(ids, lp.tolists()) for ids, lp in parts]
+    first = lists[0][1]
+    width = max(int(lp.logprob_token_ids.shape[1]) for _, lp in lists)
+    n = len(req_ids)
+    token_ids = np.zeros((n, width), dtype=first.logprob_token_ids.dtype)
+    logprobs = np.zeros((n, width), dtype=first.logprobs.dtype)
+    ranks = np.zeros((n,), dtype=first.sampled_token_ranks.dtype)
+    for ids, lp in lists:
+        cols = int(lp.logprob_token_ids.shape[1])
+        for row, req_id in enumerate(ids):
+            dst = index[req_id]
+            token_ids[dst, :cols] = lp.logprob_token_ids[row]
+            logprobs[dst, :cols] = lp.logprobs[row]
+            ranks[dst] = lp.sampled_token_ranks[row]
+    return LogprobsLists(token_ids, logprobs, ranks)
+
+
+def _logprobs_rows(batch, row_req_ids: list[str]) -> list[str]:
+    """The requests of these rows that ask for logprobs (the persistent batch's
+    ``sampling.num_logprobs``; a batch that tracks none asks for none)."""
+    index = getattr(batch, "req_id_to_index", {})
+    sampling = getattr(batch, "sampling", None)
+    if sampling is None:
+        return []
+    return [
+        r
+        for r in row_req_ids
+        if r is not None
+        and index.get(r) is not None
+        and int(sampling.num_logprobs[index[r]]) != LOGPROBS_NONE_SENTINEL
+    ]
 
 
 def _step_verifies(
@@ -222,6 +277,39 @@ def _notify_model_slot_moves(runner, moves: dict[int, int]) -> None:
     note = getattr(getattr(runner, "model", None), "note_state_slots_moved", None)
     if callable(note):
         note(dict(moves))
+
+
+class TTDeviceFaultError(RuntimeError):
+    """A device step failed earlier in this process; the runner refuses work."""
+
+
+def _latch_device_faults(method):
+    """Wrap a runner step entrypoint: refuse after a fault, latch a new one."""
+
+    @wraps(method)
+    def wrapper(self, *args, **kwargs):
+        TTModelRunner._raise_if_device_faulted(self)
+        try:
+            return method(self, *args, **kwargs)
+        except Exception as exc:
+            TTModelRunner._latch_device_fault(self, exc)
+            raise
+
+    return wrapper
+
+
+def _ttft_timed_finish(tp: "ttft_phases.StepPhases", finish: Any) -> Any:
+    """GLM53_TTFT_PHASES: the sample_tokens finish of a cold first chunk's step, stamped and logged"""
+
+    def timed(*args: Any, **kwargs: Any) -> Any:
+        tp.stamp("forward_to_finish")
+        try:
+            return finish(*args, **kwargs)
+        finally:
+            tp.stamp("finish")
+            tp.finish()
+
+    return timed
 
 
 class TTModelRunner:
@@ -435,6 +523,15 @@ class TTModelRunner:
         """
         if getattr(self, "_persistent_capture_released", False):
             return
+        get_step_meter().mark_shutting_down()
+        refused = getattr(self, "_num_refused_prefill_rows", 0)
+        if refused:
+            logger.warning(
+                "Refused %d prefill row(s) whose page-table row was shorter "
+                "than the positions they write (row_check); their requests "
+                "were finished aborted.",
+                refused,
+            )
         unspeculable_rows = getattr(self, "_num_unspeculable_verify_rows", 0)
         if unspeculable_rows:
             logger.warning(
@@ -506,6 +603,62 @@ class TTModelRunner:
                 self.supports_device_grammar = False
         if self._spec_supports_narrow_decode:
             self._spec_supports_narrow_decode = self._narrow_steps_serve_the_drafter()
+        # program 2026-10-26T17:09:24Z (a k3 MUST): the model's host-only prefill plan check, for the scheduler side
+        # (a request whose prefill cannot plan is refused there, never raised inside a step: _latch_device_faults)
+        from vllm_tt_plugin import plan_check  # noqa: PLC0415
+
+        check = getattr(self.model, "prefill_plan_error", None)
+        plan_check.register(check if callable(check) else None)
+        get_step_meter().mark_ready()
+
+    # --- Device fault latch (serving robustness) ---------------------------
+    #
+    # Any exception escaping a device step (execute_model / sample_tokens) is a
+    # fatal device fault for this process: the device-side state (traces,
+    # slots, cache pages) can no longer be trusted. The fault is latched,
+    # ``check_health`` raises it, and every later step refuses with the same
+    # fault rather than issuing a new device call. There is no retry and no
+    # device re-open: the engine core re-raises, exits non-zero, and
+    # ``TTWorker.shutdown`` closes the mesh once.
+
+    def _latch_device_fault(self, exc: BaseException) -> None:
+        if self.__dict__.get("_device_fault") is None:
+            self._device_fault = exc
+            logger.error(
+                "TT device step failed (%s: %s); the runner is now unhealthy and "
+                "refuses further steps",
+                type(exc).__name__,
+                exc,
+            )
+            # The worker's close hook (TTWorker._close_mesh_after_fault): the
+            # mesh is closed here, in this process, before the exception
+            # reaches the engine core. Once the engine reports itself dead
+            # the API process terminates it at once, and that signal used to
+            # land inside the finally-shutdown with the mesh still open.
+            hook = self.__dict__.get("_on_device_fault")
+            if callable(hook):
+                try:
+                    hook(exc)
+                except Exception:  # noqa: BLE001 -- the original fault propagates
+                    logger.exception("TT: closing the mesh after the device fault failed")
+
+    def _raise_if_device_faulted(self) -> None:
+        fault = self.__dict__.get("_device_fault")
+        if fault is not None:
+            raise TTDeviceFaultError(
+                "TT device step previously failed "
+                f"({type(fault).__name__}: {fault}); the engine is unhealthy and "
+                "must exit -- no retry re-opens the devices"
+            ) from fault
+
+    @property
+    def device_fault(self) -> BaseException | None:
+        """The first exception a device step raised, or None while healthy."""
+        return self.__dict__.get("_device_fault")
+
+    def check_health(self) -> None:
+        """Raise once a device step has failed (vLLM's executor health probe)."""
+        TTModelRunner._raise_if_device_faulted(self)
 
     def _poison_device_grammar(self) -> None:
         """Reject all later runner work after a deferred decode becomes unsafe."""
@@ -703,6 +856,13 @@ class TTModelRunner:
             self._layer_to_group_idx = mapping  # type: ignore[assignment]
 
         self.kv_caches = self._allocate_kv_caches(kv_cache_config)
+
+        # KV connector host (vLLM KVConnectorBase_V1 worker side), only when
+        # the worker installed a connector for this process. Built after the
+        # caches exist because it registers them with the connector.
+        self.kv_connector_host: TTKVConnectorHost | None = None
+        if kv_transfer_state.has_kv_transfer_group():
+            self.kv_connector_host = TTKVConnectorHost.from_runner(self)
 
     @staticmethod
     def _validate_kv_cache_groups(kv_cache_groups: list) -> None:
@@ -911,8 +1071,12 @@ class TTModelRunner:
             )
         return per_layer  # type: ignore[return-value]
 
-    def _release_model_request(self, req_id: str) -> None:
+    def _release_model_request(self, req_id: str, token_ids: list[int] | None = None) -> None:
         """Release model-owned state while the slot mapping is still valid.
+
+        ``token_ids`` (prompt + output ids of a FINISHED request) lets a prefix-caching model key the
+        request's trailing state snapshot (GLM-5.3-Flash: the KDA state at the last 128-token boundary the
+        generation crossed, resumed by the next chat turn); a preempted request passes none.
 
         Released by the request's CURRENT slot, which is the identity the model
         holds: it was handed the slot at prefill (``empty_slots``) and is told
@@ -928,7 +1092,13 @@ class TTModelRunner:
         slot = self._req_state_slot.get(req_id)
         release = getattr(getattr(self, "model", None), "release_request", None)
         if slot is not None and callable(release):
-            release(slot)
+            if token_ids is None:
+                release(slot)
+                return
+            try:
+                release(slot, token_ids=token_ids)
+            except TypeError:  # a model whose release_request takes the slot only
+                release(slot)
 
     def _update_states(self, scheduler_output: SchedulerOutput) -> None:
         """Update the cached states and the persistent batch with the
@@ -938,10 +1108,18 @@ class TTModelRunner:
         Based on _update_states for GPU/TPU backends.
         """
         persistent_batch_layout_changed = False
+        TTModelRunner._segment_drop_if_gone(self, scheduler_output)  # segtrace: before the request's slot is released
 
-        # Remove finished requests from the cached states.
+        # Remove finished requests from the cached states (their token ids go to the model's release: a
+        # prefix-caching model keys its trailing state snapshot by them).
+        finished_tokens: dict[str, list[int]] = {}
         for req_id in scheduler_output.finished_req_ids:
-            self.requests.pop(req_id, None)
+            req_state = self.requests.pop(req_id, None)
+            if req_state is not None:
+                prompt = getattr(req_state, "prompt_token_ids", None)
+                output = getattr(req_state, "output_token_ids", None)
+                if prompt is not None:
+                    finished_tokens[req_id] = [int(t) for t in prompt] + [int(t) for t in (output or [])]
 
         # Remove the finished requests from the persistent batch.
         # Upstream input processing gives resubmissions fresh internal IDs, but
@@ -950,7 +1128,7 @@ class TTModelRunner:
         # clearing the old cached state before adding the new one.
         removed_req_indices: list[int] = []
         for req_id in scheduler_output.finished_req_ids:
-            self._release_model_request(req_id)
+            self._release_model_request(req_id, finished_tokens.get(req_id))
             req_index = self.input_batch.remove_request(req_id)
             if req_index is not None:
                 removed_req_indices.append(req_index)
@@ -976,7 +1154,13 @@ class TTModelRunner:
         # they will be scheduled again sometime in the future.
         scheduled_req_ids = scheduler_output.num_scheduled_tokens.keys()
         cached_req_ids = self.input_batch.req_id_to_index.keys()
-        unscheduled_req_ids = cached_req_ids - scheduled_req_ids
+        # v3b7 (the blk2 kill, 2026-10-29T01:53Z): a request RESUMED from preemption leaves the batch too and comes
+        # back below with its resumed block ids -- upstream's rule. Without it a resumed request still batched kept its
+        # pre-preemption row and had the resumed blocks APPENDED (its freed blocks, now another request's, first).
+        resumed_req_ids = set(
+            getattr(scheduler_output.scheduled_cached_reqs, "resumed_req_ids", None) or ()
+        )
+        unscheduled_req_ids = cached_req_ids - (scheduled_req_ids - resumed_req_ids)
         # NOTE(woosuk): The persistent batch optimization assumes that
         # consecutive batches contain mostly the same requests. If batches
         # have low request overlap (e.g., alternating between two distinct
@@ -1041,6 +1225,43 @@ class TTModelRunner:
 
         # Refresh logits processors with batch state changes
         self.input_batch.refresh_logitsprocs()
+        TTModelRunner._check_scheduled_rows(self, scheduler_output, resumed_req_ids)  # (fake runners in tests too)
+
+    def _check_scheduled_rows(self, scheduler_output: SchedulerOutput, resumed_req_ids: set) -> None:
+        """v3b7 diagnostic (the blk2 kill, 2026-10-29T01:53Z: a recompute's chunk reached the generator with a 65-block
+        row where it needed 96): every scheduled row must cover its computed + scheduled tokens. A short row is logged
+        once per request with what the runner knew (counter runner_rows_short); the device step's own guard decides."""
+        ib = getattr(self, "input_batch", None)
+        if ib is None:
+            return
+        try:
+            bt = ib.block_table.block_tables[0]
+            bs = int(getattr(bt, "block_size", 0) or 0)
+            if bs <= 0:
+                return
+            for req_id, n in scheduler_output.num_scheduled_tokens.items():
+                idx = self.input_batch.req_id_to_index.get(req_id)
+                if idx is None:
+                    continue
+                need = -(-(int(self.input_batch.num_computed_tokens_cpu[idx]) + int(n)) // bs)
+                have = int(bt.num_blocks_per_row[idx])
+                if have >= need:
+                    continue
+                self.runner_rows_short = getattr(self, "runner_rows_short", 0) + 1
+                seen = self.__dict__.setdefault("_rows_short_logged", set())
+                if req_id in seen:
+                    continue
+                seen.add(req_id)
+                st = self.requests.get(req_id)
+                logger.error("TT runner: %s's batch row %d covers %d blocks < the %d its computed %d + scheduled %d "
+                             "tokens need (resumed now %s; cached block_ids %s; batched last step %s)", req_id, idx,
+                             have, need, int(self.input_batch.num_computed_tokens_cpu[idx]), int(n),
+                             req_id in resumed_req_ids, [len(g) for g in (st.block_ids if st else ())],
+                             req_id in getattr(self, "_prev_batched", ()))  # fmt: skip
+        except Exception:  # noqa: BLE001 -- a diagnostic never fails a step
+            pass
+        finally:
+            self._prev_batched = set(getattr(ib, "req_id_to_index", None) or ())
 
     def _validate_mm_feature(self, mm_feature: MultiModalFeatureSpec) -> None:
         """Validate the multimodal feature is an image."""
@@ -1183,10 +1404,20 @@ class TTModelRunner:
         for req_id in scheduler_output.preempted_req_ids or ():
             self._req_state_slot.pop(req_id, None)
 
-    def _alloc_prefill_state_slots(self, row_req_ids: list[str]) -> list[int]:
+    def _alloc_prefill_state_slots(
+        self, row_req_ids: list[str], preferred_slots: list[int] | None = None
+    ) -> list[int]:
         """Pick each prefilling request's state slot, skipping slots that live
         off-batch requests own. Prefers its own row (where it decodes), so the
-        steady state moves nothing.
+        steady state moves nothing: the build row, or ``preferred_slots[row]``
+        when the build covers only part of the batch (a mixed step's prefill
+        rows, whose batch rows are where they will decode).
+
+        A prefilling request that still owns a slot is a chunked-prefill
+        continuation (``_release_dead_state_slots`` dropped the slots of finished
+        and preempted requests, so a resume starts without one): its earlier
+        chunks left live state in that slot, so it keeps it whatever row it was
+        re-added at.
 
         Exhaustion is unreachable: holders and prefills are disjoint and both count
         against ``max_num_seqs``, which is ``n_slots``. Getting here means the map has
@@ -1205,10 +1436,20 @@ class TTModelRunner:
             for req_id, slot in self._req_state_slot.items()
             if req_id not in prefilling and req_id in self.requests
         }
+        continuing = {
+            req_id: slot
+            for req_id, slot in self._req_state_slot.items()
+            if req_id in prefilling and req_id in self.requests
+        }
+        held |= set(continuing.values())
         slots: list[int] = []
         for row, req_id in enumerate(row_req_ids):
-            if row not in held:
-                slot = row
+            if req_id in continuing:
+                slots.append(continuing[req_id])
+                continue
+            preferred = row if preferred_slots is None else int(preferred_slots[row])
+            if 0 <= preferred < n_slots and preferred not in held:
+                slot = preferred
             else:
                 free = [s for s in range(n_slots) if s not in held]
                 if not free:
@@ -1260,7 +1501,20 @@ class TTModelRunner:
                 f"map={self._req_state_slot}"
             )
         taken = set(want)
-        remap = want + [s for s in range(n_slots) if s not in taken]
+        open_ = getattr(self, "_segment_open", None)
+        pinned = self._req_state_slot.get(open_["req_id"]) if open_ is not None else None
+        if pinned is None:
+            remap = want + [s for s in range(n_slots) if s not in taken]
+        else:
+            # segtrace: the open chunk's slot stays where it is (the model refuses to move an open chunk; its last
+            # segment writes the state to that slot): every other non-decode slot fills the remaining rows in order
+            if pinned < len(want) or pinned in taken:
+                raise RuntimeError(
+                    f"segtrace: the open chunk's slot {pinned} lies inside the {len(want)} decode rows: it cannot stay "
+                    f"pinned (map={self._req_state_slot})"
+                )
+            rest = iter(s for s in range(n_slots) if s not in taken and s != pinned)
+            remap = want + [pinned if pos == pinned else next(rest) for pos in range(len(want), n_slots)]
         # The gather moves every slot, not just the batch rows: ownership must follow.
         # Build the new map whole and swap it in, so no read sees it half-written.
         by_slot: dict[int, list[str]] = {}
@@ -1465,6 +1719,16 @@ class TTModelRunner:
         only narrow a distribution that temperature 0 has already collapsed to a
         point, so a greedy request carrying them is still greedy.
         """
+        # A request the runner no longer holds finished before this step's
+        # result was applied (async scheduling applies a completed step after
+        # the scheduler retired the request). It has no next step to draft
+        # for, and it has also left the batch's sampling sets below, so a
+        # sampled request would read as greedy here. A model-owned drafter that
+        # entered its speculative state for it started from a stale position
+        # (Stage 17, the k4b twins, 2026-10-27).
+        requests = getattr(self, "requests", None)
+        if requests is not None and req_id not in requests:
+            return False
         batch = self.input_batch
         # getattr rather than attribute access: the gate has to stay total for
         # any batch the runner is handed. A batch that tracks none of these
@@ -1477,6 +1741,15 @@ class TTModelRunner:
             "repetition_penalties_reqs",
         ):
             if req_id in getattr(batch, attr, ()):
+                return False
+        # A request asking for logprobs: the argmax_ids walk carries no logits
+        # across the boundary, so its logprobs come from the ordinary decode's
+        # host sampler, the same values a plain launch returns. It is decoded
+        # without speculation, as a sampled request is.
+        index = getattr(batch, "req_id_to_index", {}).get(req_id)
+        sampling = getattr(batch, "sampling", None)
+        if index is not None and sampling is not None:
+            if int(sampling.num_logprobs[index]) != LOGPROBS_NONE_SENTINEL:
                 return False
         return True
 
@@ -1621,6 +1894,19 @@ class TTModelRunner:
             # A verify has authoritative submitted positions. Its physical
             # acceptance count can exceed the prefix retained at max_model_len.
             positions = self._committed_positions(model_input.input_positions, width)
+        # A request whose drafts _publish_draft would discard (not speculable)
+        # is handed to the drafter as an idle row (positions -1, the padding
+        # rows' convention): a model-owned drafter then does not enter its
+        # speculative state for it, which a model that speculates for a lone
+        # user would otherwise do and undo on every step.
+        unspeculable = [
+            row
+            for row, req_id in enumerate(row_req_ids)
+            if req_id is not None and not self._request_is_speculable(req_id)
+        ]
+        if unspeculable:
+            positions = positions.clone()
+            positions[unspeculable] = -1
         drafted = self.model.propose_draft_tokens(
             num_drafts,
             committed,
@@ -1824,10 +2110,35 @@ class TTModelRunner:
         positions = torch.where(padded, torch.full_like(positions, -1), positions)
         return tokens, positions
 
+    def _row_is_still_prefilling(self, row: int) -> bool:
+        """Whether persistent-batch ``row`` has prompt (or replay) work left.
+
+        Any uncomputed PROMPT token is prefill work, including a final chunk of
+        exactly one token: prompt work must dispatch through the prefill path,
+        which owns chunk bookkeeping (e.g. the intermediate-prefill mask and
+        vision rope state). Past the prompt, a steady-state step legitimately
+        has exactly one output width outstanding (the sampled token for AR, one
+        whole canvas for block models); only MORE than that means uncomputed
+        history (preemption-resume replay). A plain ``computed < total``
+        comparison dispatched every post-first block step as prompt work,
+        re-encoding the entire session per canvas: quadratic prefill and decode
+        never ran.
+        """
+        input_batch = self.input_batch
+        # ``num_computed_tokens`` is the scheduler's pre-step snapshot.
+        num_computed = input_batch.num_computed_tokens_cpu[row]
+        return bool(
+            num_computed < input_batch.num_prompt_tokens[row]
+            or num_computed + self._output_tokens_per_step < input_batch.num_tokens[row]
+        )
+
     def _prepare_model_inputs(
         self,
         scheduler_output: SchedulerOutput,
         grammar_output: GrammarOutput | None,
+        *,
+        req_indices: list[int] | None = None,
+        is_prompt: bool | None = None,
     ) -> TTModelInput:
         """Build a ``TTModelInput`` for one prefill or decode step.
 
@@ -1845,6 +2156,13 @@ class TTModelRunner:
                 structured-output bitmasks.
             grammar_output: Structured-output bitmasks for this step, or
                 ``None`` when no request uses guided decoding.
+            req_indices: Persistent-batch rows to build (default: the whole
+                batch). A mixed step builds its prefill rows and its decode
+                rows as two inputs (``_prepare_mixed_model_inputs``); input row
+                ``i`` is batch row ``req_indices[i]``.
+            is_prompt: The kind of the build when the caller has classified
+                the rows itself (a mixed step's parts); ``None`` derives it
+                from the scheduler output.
 
         Returns:
             A ``TTModelInput`` with tokens, positions, block tables, sampling
@@ -1857,9 +2175,12 @@ class TTModelRunner:
         batch_num_reqs = input_batch.num_reqs
         assert batch_num_reqs > 0
 
-        # The whole local batch.
-        req_indices = list(range(batch_num_reqs))
+        # The whole local batch, unless a mixed step builds one part of it.
+        whole_batch = req_indices is None
+        if req_indices is None:
+            req_indices = list(range(batch_num_reqs))
         num_reqs = len(req_indices)
+        assert num_reqs > 0
         row_req_ids = [input_batch.req_ids[i] for i in req_indices]
         if self._num_speculative_tokens:
             # Pruned here rather than where requests finish, because every
@@ -1917,48 +2238,30 @@ class TTModelRunner:
         block_tables = block_tables_per_group[0]
 
         # NOTE: We assume that all sequences in the group are all prompts or
-        # all decodes.
+        # all decodes (a mixed step builds its two kinds as two inputs).
         cached_reqs = scheduler_output.scheduled_cached_reqs
         num_scheduled = scheduler_output.num_scheduled_tokens
 
-        def _is_still_prefilling(req_id: str) -> bool:
-            # Any uncomputed PROMPT token is prefill work, including a final
-            # chunk of exactly one token: prompt work must dispatch through
-            # the prefill path, which owns chunk bookkeeping (e.g. the
-            # intermediate-prefill mask and vision rope state). Past the
-            # prompt, a steady-state step legitimately has exactly one output
-            # width outstanding (the sampled token for AR, one whole canvas
-            # for block models); only MORE than that means uncomputed history
-            # (preemption-resume replay). A plain ``computed < total``
-            # comparison dispatched every post-first block step as prompt
-            # work, re-encoding the entire session per canvas: quadratic
-            # prefill and decode never ran.
-            row = input_batch.req_id_to_index[req_id]
-            # ``num_computed_tokens`` is the scheduler's pre-step snapshot.
-            num_computed = input_batch.num_computed_tokens_cpu[row]
-            return (
-                num_computed < input_batch.num_prompt_tokens[row]
-                or num_computed + self._output_tokens_per_step
-                < input_batch.num_tokens[row]
+        if is_prompt is None:
+            # A "prefill" step can contain:
+            # - brand new requests (scheduled_new_reqs), and/or
+            # - resumed-from-preemption requests (scheduled_cached_reqs with
+            #   resumed_req_ids set) that need to replay tokens to rebuild KV,
+            #   and/or
+            # - chunked-prefill continuations: cached requests that have not
+            #   computed all their prompt tokens yet.
+            has_chunked_continuation = any(
+                TTModelRunner._row_is_still_prefilling(
+                    self, input_batch.req_id_to_index[req_id]
+                )
+                for req_id in cached_reqs.req_ids
+                if req_id not in cached_reqs.resumed_req_ids
             )
-
-        # A "prefill" step can contain:
-        # - brand new requests (scheduled_new_reqs), and/or
-        # - resumed-from-preemption requests (scheduled_cached_reqs with
-        #   resumed_req_ids set) that need to replay tokens to rebuild KV,
-        #   and/or
-        # - chunked-prefill continuations: cached requests that have not
-        #   computed all their prompt tokens yet.
-        has_chunked_continuation = any(
-            _is_still_prefilling(req_id)
-            for req_id in cached_reqs.req_ids
-            if req_id not in cached_reqs.resumed_req_ids
-        )
-        is_prompt = (
-            len(scheduler_output.scheduled_new_reqs) > 0
-            or bool(cached_reqs.resumed_req_ids)
-            or has_chunked_continuation
-        )
+            is_prompt = (
+                len(scheduler_output.scheduled_new_reqs) > 0
+                or bool(cached_reqs.resumed_req_ids)
+                or has_chunked_continuation
+            )
         sample_params = input_batch.sampling
         intermediate_prefill_mask: torch.Tensor | None = None
         num_valid_drafts: torch.Tensor | None = None
@@ -2019,12 +2322,40 @@ class TTModelRunner:
                     row_req_ids,
                     self._num_speculative_tokens,
                 )
-                if _step_verifies(
+                verifies = _step_verifies(
                     self._spec_supports_narrow_decode,
                     num_valid_drafts,
                     accepted_counts,
                     len(row_req_ids),
-                ):
+                )
+                if verifies and _logprobs_rows(self.input_batch, row_req_ids):
+                    if self._spec_supports_narrow_decode and not any(
+                        int(accepted_counts[row]) > 1 for row in range(len(row_req_ids))
+                    ):
+                        # A row asking for logprobs needs the ordinary tail:
+                        # its logprobs come from the step's logits, which a
+                        # verify does not return. With no multi-token commit
+                        # to resolve the step IS an ordinary decode: the drafts
+                        # of the other rows are rejected (each commits its one
+                        # ordinary token) and are proposed again next step.
+                        verifies = False
+                        self._num_logprobs_demoted_verifies = (
+                            getattr(self, "_num_logprobs_demoted_verifies", 0) + 1
+                        )
+                    else:
+                        # A pending multi-token commit must reach the model in
+                        # this verify; the logprobs rows of this one step
+                        # cannot be served. Counted and logged, never silent.
+                        self._num_logprobs_verify_rows = getattr(
+                            self, "_num_logprobs_verify_rows", 0
+                        ) + len(_logprobs_rows(self.input_batch, row_req_ids))
+                        logger.warning(
+                            "speculative verify with logprobs requests %s: a "
+                            "multi-token commit is unresolved, their logprobs "
+                            "for this step are not available",
+                            _logprobs_rows(self.input_batch, row_req_ids),
+                        )
+                if verifies:
                     self._note_unspeculable_verify_rows(row_req_ids)
                     # Uniformly 1+K wide, so a model needs one verify shape
                     # rather than two.
@@ -2142,6 +2473,14 @@ class TTModelRunner:
             self.requests,
             scheduler_output,
         )
+        if not whole_batch:
+            # One part of a mixed step: the other part's structured rows are
+            # sampled (and grammar-checked) by its own build. ``has_structured``
+            # stays step-wide, which keeps this part on the samplers the
+            # single-kind path would pick for a structured step.
+            scheduled_structured_req_ids = scheduled_structured_req_ids & frozenset(
+                row_req_ids
+            )
         has_scheduled_structured = bool(scheduled_structured_req_ids)
         if is_prompt:
             structured_output_req_ids = frozenset(
@@ -2188,10 +2527,20 @@ class TTModelRunner:
         )
         if has_structured and not has_scheduled_structured:
             perform_device_sampling = False
-        if intermediate_prefill_mask is not None and intermediate_prefill_mask.any():
+        if (
+            intermediate_prefill_mask is not None
+            and intermediate_prefill_mask.any()
+            and not (
+                getattr(getattr(self, "model", None), "model_capabilities", None) or {}
+            ).get("supports_partial_prefill_sampling", False)
+        ):
             # Device sampling advances device RNG state for every row it reads,
             # which an intermediate chunk must not do. Host sampling can hand
-            # those rows a generator clone instead.
+            # those rows a generator clone instead. A model declaring
+            # supports_partial_prefill_sampling keeps device sampling: it is
+            # told which rows are intermediate (sample_rows) and neither
+            # samples them nor advances their RNG; their placeholder tokens
+            # are dropped by _build_chunked_prefill_output.
             perform_device_sampling = False
         defer_device_sampling = (
             perform_device_sampling and has_scheduled_structured and not is_prompt
@@ -2283,7 +2632,13 @@ class TTModelRunner:
         prefill_empty_slots = None
         slot_remap = None
         if is_prompt:
-            prefill_empty_slots = self._alloc_prefill_state_slots(row_req_ids)
+            prefill_empty_slots = (
+                self._alloc_prefill_state_slots(row_req_ids)
+                if whole_batch
+                else self._alloc_prefill_state_slots(
+                    row_req_ids, preferred_slots=req_indices
+                )
+            )
         else:
             # Advances the ownership map to the post-gather layout, so the returned
             # remap has to reach the device: dropping it would leave the map claiming
@@ -2335,11 +2690,12 @@ class TTModelRunner:
         self,
         scheduler_output: SchedulerOutput,
         grammar_output: GrammarOutput | None,
-    ) -> TTModelInput | None:
+    ) -> TTModelInput | TTMixedModelInput | None:
         """
         Update internal state with the scheduler output and build
         TTModelInput without executing the model.
-        Returns None if there is no scheduled work in this step.
+        Returns None if there is no scheduled work in this step, and a
+        ``TTMixedModelInput`` for a mixed prefill+decode step.
 
         For data parallel, this function is called by each DP rank to build
         TTModelInput from it's own scheduler output.
@@ -2361,9 +2717,71 @@ class TTModelRunner:
         if not scheduler_output.total_num_scheduled_tokens:
             return None
 
+        if is_tt_mixed_step(scheduler_output):
+            return self._prepare_mixed_model_inputs(scheduler_output)
+
         # Prepare model inputs only
         model_input = self._prepare_model_inputs(scheduler_output, grammar_output)
         return model_input
+
+    def _prepare_mixed_model_inputs(
+        self, scheduler_output: SchedulerOutput
+    ) -> TTMixedModelInput | TTModelInput:
+        """Split a mixed step's batch into its prefill rows and its decode rows.
+
+        A row is prefill work when the request is new or resumed this step, or
+        still has prompt / replay tokens to compute (``_row_is_still_prefilling``);
+        every other row decodes. A batch that turns out to hold one kind only
+        is built as an ordinary step of that kind.
+
+        The prefill part is built first: it claims the prefilling requests'
+        state slots, and the decode part's slot gather (which permutes every
+        slot, the prefilling ones included) must see those claims.
+
+        The decode part covers only the decoding rows, so it always reloads its
+        inputs from the host: the rows it leaves out (prefilling ones) hold no
+        resident decode inputs, and the decode layout of the previous step is
+        not this one.
+        """
+        input_batch = self.input_batch
+        num_reqs = input_batch.num_reqs
+        cached_reqs = scheduler_output.scheduled_cached_reqs
+        fresh = {req.req_id for req in scheduler_output.scheduled_new_reqs}
+        fresh.update(cached_reqs.resumed_req_ids)
+        prefill_rows: list[int] = []
+        decode_rows: list[int] = []
+        for row in range(num_reqs):
+            req_id = input_batch.req_ids[row]
+            if req_id in fresh or self._row_is_still_prefilling(row):
+                prefill_rows.append(row)
+            else:
+                decode_rows.append(row)
+        if not prefill_rows or not decode_rows:
+            return self._prepare_model_inputs(scheduler_output, None)
+        if (
+            self._num_speculative_tokens
+            or self.request_specific_rope
+            or self._output_tokens_per_step != 1
+        ):
+            # TTScheduler._mixed_steps_unsupported_reason keeps these launches
+            # on single-kind steps; reaching here means the two disagree.
+            raise RuntimeError(
+                "mixed prefill+decode step reached a runner configuration that "
+                "cannot split it (speculative decoding, request-specific RoPE "
+                "or block output)"
+            )
+        prefill = self._prepare_model_inputs(
+            scheduler_output, None, req_indices=prefill_rows, is_prompt=True
+        )
+        self._decode_layout_changed_since_last_decode = True
+        decode = self._prepare_model_inputs(
+            scheduler_output, None, req_indices=decode_rows, is_prompt=False
+        )
+        return TTMixedModelInput(
+            prefill=prefill,
+            decode=decode,
+            req_ids=tuple(input_batch.req_ids[:num_reqs]),
+        )
 
     # All lane-specific input/output shaping lives in ``TTLaneInputBatch``
     # (``apply_step_plan`` / ``build_model_input`` / ``extract_output``) and the
@@ -2625,7 +3043,32 @@ class TTModelRunner:
         return self.apply_and_build_runner_output(sampled, logprobs, req_ids=req_ids)
 
     @torch.no_grad()
+    @_latch_device_faults
     def execute_model(
+        self,
+        scheduler_output: SchedulerOutput,
+    ) -> ModelRunnerOutput | None:
+        """Run this rank's device forward; records the step boundary for the step meter.
+
+        The meter (``vllm_tt_plugin.stepmeter``, on when ``GLM53_STEP_STATUS`` is
+        set) is the supervisor's liveness channel: a step that raises is counted
+        as a device error before the exception propagates to the engine.
+        """
+        meter = get_step_meter()
+        meter.begin()
+        gct = gc_tuning.get()  # v3b5: the idle refreeze waits for no step in flight
+        if gct is not None:
+            gct.step_begin()
+        try:
+            return self._execute_model_impl(scheduler_output)
+        except BaseException as exc:
+            meter.error(exc)
+            raise
+        finally:
+            if gct is not None:
+                gct.step_end()
+
+    def _execute_model_impl(
         self,
         scheduler_output: SchedulerOutput,
     ) -> ModelRunnerOutput | None:
@@ -2638,34 +3081,81 @@ class TTModelRunner:
         DP reaches this entrypoint once per rank, each over its own mesh.
         """
         TTModelRunner._raise_if_device_grammar_poisoned(self)
+        kv_host = getattr(self, "kv_connector_host", None)
+        # GLM53_TTFT_PHASES: the runner's phase stamps for a step that runs a cold prompt's first chunk
+        tp = ttft_phases.StepPhases(scheduler_output) if ttft_phases.on() else None
 
         # Single-process lane-DP: the lane scheduler attaches a per-step plan to
         # the scheduler output. When present, the step runs over the merged lane
         # batch (``TTLaneInputBatch`` owns all the lane-specific input/output
         # shaping); the generic path below stays lane-agnostic.
         if get_tt_step_plan(scheduler_output) is not None:
+            if kv_host is not None:
+                raise NotImplementedError(
+                    "KV connectors are not supported in lane-DP mode"
+                )
+            get_step_meter().set_kind("lane")
             return self._execute_lane_step(scheduler_output)
+
+        # Connector: preempted / evicted pages are reported before the batch
+        # update below can let a new request overwrite them.
+        if kv_host is not None:
+            kv_host.begin_step(scheduler_output)
+        tp is not None and tp.stamp("begin_step")
 
         # Decide whether the next build can remain one step host-stale before
         # mutating the persistent batch. On a transition, finalize pending work
         # now but defer applying it until ``build_model_input`` has processed
-        # lifecycle events and the forced-reset discard boundary.
+        # lifecycle events and the forced-reset discard boundary. A mixed step
+        # always drains: it runs synchronously, and its decode rows are built
+        # from host state, which every outstanding decode must have reached.
+        mixed_step = is_tt_mixed_step(scheduler_output)
         steady_decode_candidate = (
-            self.async_decode.can_attempt_steady_decode_from_scheduler(scheduler_output)
+            not mixed_step
+            and self.async_decode.can_attempt_steady_decode_from_scheduler(
+                scheduler_output
+            )
         )
-        if self.async_decode.must_drain_pending_async_steps(
+        if mixed_step or self.async_decode.must_drain_pending_async_steps(
             steady_decode_candidate, scheduler_output
         ):
             self.async_decode.wait_for_all_pending_async_steps()
+        tp is not None and tp.stamp("drain")
 
         # Grammar is applied at sample time, so the forward builds without it.
         model_input = self.build_model_input(scheduler_output, None)
+        tp is not None and tp.stamp("build")
         if model_input is None:
+            get_step_meter().cancel()
+            if kv_host is not None:
+                # No forward, but the connector still loads / reports finishes.
+                return kv_host.no_forward(scheduler_output)
             return EMPTY_MODEL_RUNNER_OUTPUT
+        model_input = TTModelRunner._segment_prepare(self, scheduler_output, model_input)
+        tp is not None and tp.stamp("segment")
+        if isinstance(model_input, TTMixedModelInput):
+            return self._execute_mixed_step(scheduler_output, model_input, kv_host)
 
         is_decode = model_input.prompt_lens is None
+        if not is_decode:
+            # A page-table row shorter than the positions its prefill writes
+            # (vllm_tt_plugin.row_check) is refused before any device work:
+            # one failed request instead of a latched device fault.
+            short = TTModelRunner._short_prefill_rows(self, model_input)
+            if short:
+                return TTModelRunner._refuse_prefill_step(
+                    self, scheduler_output, model_input, short, kv_host
+                )
+        get_step_meter().set_kind("decode" if is_decode else "prefill")
         if model_input.defer_device_sampling:
             self.async_decode.wait_for_all_pending_async_steps()
+        if kv_host is not None:
+            # Prefix pages must be resident before the device program reads
+            # them: start every load and wait for all layers here.
+            model_input = kv_host.load(scheduler_output, model_input) or model_input
+        tp is not None and tp.stamp("load")
+        if not is_decode:
+            TTModelRunner._segment_record(self, model_input)
         if (
             self.async_decode_scheduling
             and is_decode
@@ -2678,21 +3168,301 @@ class TTModelRunner:
                 model_input,
                 steady_decode_fast_path=steady_decode_fast_path,
             )
-            self._pending_samples.append(
-                partial(
-                    self._finish_async_decode,
-                    wrapper=wrapper,
-                    model_input=model_input,
-                    lane_total=None,
-                )
+            finish_async = partial(
+                self._finish_async_decode,
+                wrapper=wrapper,
+                model_input=model_input,
+                lane_total=None,
             )
+            if kv_host is not None:
+                finish_async = kv_host.wrap_finish(
+                    scheduler_output, model_input, finish_async
+                )
+            self._pending_samples.append(finish_async)
             return None
 
         # Synchronous path (prefill, or decode without async scheduling): run
         # the forward now and defer sampling to ``sample_tokens``.
         fwd = self._forward_with_model_input(model_input)
-        self._pending_samples.append(partial(self._finish_front_packed_sync, fwd=fwd))
+        tp is not None and tp.stamp("forward")
+        if not is_decode:
+            # v3b4 SHORT_FIRST pacing: a head-less chunk run returns at the device pace (one run left queued), so the
+            # scheduler runs once per device run instead of pre-submitting a long's whole prefill
+            prefill_pacer.after_prefill_submit(self, model_input)
+        finish_sync = partial(self._finish_front_packed_sync, fwd=fwd)
+        if kv_host is not None:
+            # Saves run at sample time, after the forward's read-back, so the
+            # pages the connector copies out are the ones this step wrote.
+            finish_sync = kv_host.wrap_finish(
+                scheduler_output, model_input, finish_sync
+            )
+        if tp is not None and tp.marks:
+            finish_sync = _ttft_timed_finish(tp, finish_sync)
+        self._pending_samples.append(finish_sync)
         return None
+
+    def _short_prefill_rows(self, model_input) -> dict[str, tuple[int, int, int]]:
+        """The prefill rows whose page-table row covers fewer blocks than the
+        positions the prefill writes: ``{req_id: (live, need, end)}``.
+
+        ``end`` is the row's prompt length (the prefill writes positions below
+        it), ``need`` = ceil(end / block_size), ``live`` = the row's leading
+        non-null blocks (block 0 is vLLM's null block, the padding
+        ``block_tables_for_rows`` writes past a row's live count). The model's
+        own check rounds ``end`` up to its prefill alignment, so it can refuse
+        more; this is the floor every model shares.
+        """
+        bt = getattr(model_input, "block_tables", None)
+        lens = getattr(model_input, "prompt_lens", None)
+        req_ids = getattr(model_input, "row_req_ids", None) or []
+        if bt is None or lens is None or not req_ids:
+            return {}
+        # (12, program 2026-10-29T03:05:00Z: the check must never fail a step itself -- a raise here latches the
+        # device fault it exists to avoid; a runner built without cache_config, as the connector tests' mock, reads
+        # the block size from its KV cache config or its batch, else skips)
+        bs = TTModelRunner._row_check_block_size(self)
+        if not bs:
+            return {}
+        bt = torch.as_tensor(bt)
+        lens = torch.as_tensor(lens).reshape(-1)
+        out = {}
+        for row, req_id in enumerate(req_ids):
+            if req_id is None or row >= bt.shape[0] or row >= lens.shape[0]:
+                continue
+            end = int(lens[row])
+            need = -(-end // bs)
+            zero = torch.nonzero(bt[row] == 0)
+            live = int(zero[0]) if zero.numel() else int(bt.shape[1])
+            if live < need:
+                out[req_id] = (live, need, end)
+        return out
+
+    def _row_check_block_size(self) -> int:
+        """the KV block size for the row check: cache_config, else the KV cache config's first group, else the batch's
+        block table; 0 = unknown (the check skips)"""
+        for get in (lambda: self.cache_config.block_size,
+                    lambda: self.kv_cache_config.kv_cache_groups[0].kv_cache_spec.block_size,
+                    lambda: self.input_batch.block_table.block_tables[0].block_size):  # fmt: skip
+            try:
+                v = int(get())
+                if v > 0:
+                    return v
+            except Exception:  # noqa: BLE001,S112 -- the next source
+                continue
+        return 0
+
+    def _refuse_prefill_step(
+        self,
+        scheduler_output: SchedulerOutput,
+        model_input,
+        short: dict[str, tuple[int, int, int]],
+        kv_host: TTKVConnectorHost | None,
+    ) -> ModelRunnerOutput:
+        """Refuse a prefill step whose every row is short (``row_check``).
+
+        No device work runs: each row gets an empty output (no token, as an
+        intermediate chunk), its request is recorded in ``row_check`` and the
+        scheduler finishes it aborted at its next schedule. The connector still
+        loads / reports finishes (``no_forward``). A step mixing short and
+        sound rows raises, as before: part of a prefill cannot be refused.
+        """
+        from vllm_tt_plugin import row_check  # noqa: PLC0415
+
+        rows = [r for r in (model_input.row_req_ids or []) if r is not None]
+        sound = sorted(set(rows) - set(short))
+        if sound:
+            raise ValueError(
+                f"prefill step: page-table rows short for {sorted(short)} beside "
+                f"sound rows {sound}; part of a prefill step cannot be refused"
+            )
+        for req_id, (live, need, end) in short.items():
+            why = f"page row: {live} blocks < the {need} positions [0, {end}) need"
+            row_check.refuse(req_id, why)
+            logger.error(
+                "TT prefill of %s refused before any device work: its "
+                "page-table row covers %d blocks < the %d its positions "
+                "[0, %d) need; the request is finished aborted, the engine "
+                "keeps stepping",
+                req_id,
+                live,
+                need,
+                end,
+            )
+        self._num_refused_prefill_rows = getattr(
+            self, "_num_refused_prefill_rows", 0
+        ) + len(short)
+        get_step_meter().cancel()
+        kv_output = (
+            kv_host.no_forward(scheduler_output).kv_connector_output
+            if kv_host is not None
+            else None
+        )
+        return ModelRunnerOutput(
+            req_ids=list(rows),
+            req_id_to_index={req_id: i for i, req_id in enumerate(rows)},
+            sampled_token_ids=[[] for _ in rows],
+            logprobs=None,
+            prompt_logprobs_dict=dict.fromkeys(rows),
+            pooler_output=[],
+            kv_connector_output=kv_output,
+        )
+
+    def _execute_mixed_step(
+        self,
+        scheduler_output: SchedulerOutput,
+        mixed: TTMixedModelInput,
+        kv_host: TTKVConnectorHost | None,
+    ) -> None:
+        """Submit a mixed step: the prefill part, then the decode part.
+
+        Both go through the calls a single-kind step of their kind makes
+        (``prefill_forward``, then ``decode_forward`` over the decoding rows
+        only), back to back with no sampling in between; sampling of both
+        parts is deferred to ``sample_tokens`` like any synchronous step. The
+        KV connector sees the step once: its loads serve the prefill rows (a
+        decode row never loads) before the first submission, and its saves run
+        at sample time (``TTKVConnectorHost.wrap_finish_mixed``).
+
+        The step is synchronous (the caller drained every outstanding async
+        decode before the build) and leaves the decode chain invalid: the next
+        decode includes the rows this step prefilled, which hold no resident
+        decode inputs, so it reloads from the host as the first decode after a
+        prefill step does.
+        """
+        get_step_meter().set_kind("mixed")
+        if kv_host is not None:
+            # Prefix pages must be resident before the prefill reads them.
+            mixed = replace(mixed, prefill=kv_host.load(scheduler_output, mixed.prefill) or mixed.prefill)
+        TTModelRunner._segment_record(self, mixed.prefill)
+        prefill_fwd = self._forward_with_model_input(mixed.prefill)
+        decode_fwd = self._forward_with_model_input(mixed.decode)
+        self._decode_layout_changed_since_last_decode = True
+        self.async_decode.note_prefill_submitted()
+        finish = partial(
+            self._finish_mixed_sync,
+            prefill_fwd=prefill_fwd,
+            decode_fwd=decode_fwd,
+            req_ids=mixed.req_ids,
+        )
+        if kv_host is not None:
+            # The decode's slot gather permutes every slot, so it can move the
+            # state the prefill just wrote. The connector's saves (chunk
+            # checkpoints, possibly deferred to the next step's begin_step)
+            # read each prefill row's state from the slot it holds now.
+            prefill_now = mixed.prefill
+            if mixed.prefill.prefill_empty_slots is not None:
+                held = self._req_state_slot
+                prefill_now = replace(
+                    mixed.prefill,
+                    prefill_empty_slots=[
+                        held.get(req_id, slot)
+                        for req_id, slot in zip(
+                            mixed.prefill.row_req_ids or (),
+                            mixed.prefill.prefill_empty_slots,
+                        )
+                    ],
+                )
+            finish = kv_host.wrap_finish_mixed(
+                scheduler_output, prefill_now, mixed.decode, finish
+            )
+        self._pending_samples.append(finish)
+        return None
+
+    def _finish_mixed_sync(
+        self,
+        grammar_output: GrammarOutput | None,
+        *,
+        prefill_fwd: _SyncForward,
+        decode_fwd: _SyncForward,
+        req_ids: tuple[str, ...],
+    ) -> ModelRunnerOutput:
+        deferred = bool(decode_fwd.model_input.defer_device_sampling)
+        try:
+            return TTModelRunner._finish_mixed_sync_impl(
+                self,
+                grammar_output,
+                prefill_fwd=prefill_fwd,
+                decode_fwd=decode_fwd,
+                req_ids=req_ids,
+            )
+        except Exception:
+            if deferred:
+                self._poison_device_grammar()
+            raise
+
+    def _finish_mixed_sync_impl(
+        self,
+        grammar_output: GrammarOutput | None,
+        *,
+        prefill_fwd: _SyncForward,
+        decode_fwd: _SyncForward,
+        req_ids: tuple[str, ...],
+    ) -> ModelRunnerOutput:
+        """Sample both parts of a mixed step and build its one output.
+
+        Each part is sampled exactly as a single-kind step of its kind (its
+        own grammar rows, sampler and generators). The output covers the
+        step's whole batch in batch order: every decode row and every prefill
+        row whose prompt ends this step carry their token; an intermediate
+        chunk's row carries none, as in a chunked prefill step. Host state
+        takes only the emitted tokens, immediately under the synchronous
+        scheduler and through the lifecycle-deferred queue under the async one
+        (``_enqueue_deferred_state_apply``), like the single-kind outputs.
+        """
+        index = {req_id: i for i, req_id in enumerate(req_ids)}
+        sampled: list[list[int]] = [[] for _ in req_ids]
+        emit_req_ids: list[str] = []
+        emit_tokens: list[int] = []
+        logprob_parts: list[tuple[list[str], LogprobsTensors]] = []
+        # Under the async scheduler a decode row's request can finish through
+        # the previous step's output after this step was scheduled; the
+        # grammar output then omits its row. As on the async decode path
+        # (``_finish_async_decode``) the row stays unrestricted and late-output
+        # suppression discards its token. A prefill row cannot finish before
+        # its first token, so the prefill part stays strict, as a prefill
+        # step is.
+        decode_strict = not TTModelRunner._uses_async_scheduler(self)
+        for fwd, strict in ((prefill_fwd, True), (decode_fwd, decode_strict)):
+            bitmask = self._reorder_grammar_bitmask(
+                grammar_output,
+                fwd.model_input,
+                lane_total=None,
+                require_complete=strict,
+            )
+            if bitmask is not None:
+                fwd = replace(
+                    fwd, model_input=replace(fwd.model_input, grammar_bitmask=[bitmask])
+                )
+            tokens_per_dp, logprobs_per_dp = self._sample_sync_forward(fwd)
+            part_req_ids = fwd.model_input.row_req_ids
+            assert part_req_ids is not None
+            tokens = tokens_per_dp[0].reshape(len(part_req_ids), -1)
+            intermediate = fwd.model_input.intermediate_prefill_mask
+            for row, req_id in enumerate(part_req_ids):
+                if intermediate is not None and bool(intermediate[row]):
+                    continue
+                token = int(tokens[row, 0])
+                sampled[index[req_id]] = [token]
+                emit_req_ids.append(req_id)
+                emit_tokens.append(token)
+            if logprobs_per_dp and logprobs_per_dp[0] is not None:
+                logprob_parts.append((list(part_req_ids), logprobs_per_dp[0]))
+
+        runner_output = ModelRunnerOutput(
+            req_ids=list(req_ids),
+            req_id_to_index=index,
+            sampled_token_ids=sampled,
+            logprobs=_merge_part_logprobs(req_ids, index, logprob_parts),
+            prompt_logprobs_dict=dict.fromkeys(req_ids, None),
+            pooler_output=[],
+        )
+        if emit_req_ids:
+            emitted = torch.tensor(emit_tokens, dtype=torch.int32).view(-1, 1)
+            if TTModelRunner._uses_async_scheduler(self):
+                self._enqueue_deferred_state_apply(emitted, emit_req_ids, runner_output)
+            else:
+                self._apply_sampled_tokens_to_state(emitted, req_ids=emit_req_ids)
+        return runner_output
 
     def _reorder_grammar_bitmask(
         self,
@@ -3034,6 +3804,7 @@ class TTModelRunner:
             # candidate state this step left the model holding. Length-capped
             # rows record what they actually committed, never the full count.
             self._req_accepted_counts[req_id] = max(len(block), 1)
+            get_step_meter().spec_accepted(len(block))
             committed_by_req[req_id] = block
         return committed_by_req
 
@@ -3176,6 +3947,7 @@ class TTModelRunner:
             )
         return runner_output
 
+    @_latch_device_faults
     def sample_tokens(
         self, grammar_output: GrammarOutput | None
     ) -> ModelRunnerOutput | AsyncTTModelRunnerOutput | None:
@@ -3198,7 +3970,14 @@ class TTModelRunner:
         if not self._pending_samples:
             return None
         finish = self._pending_samples.popleft()
-        return finish(grammar_output)
+        meter = get_step_meter()
+        try:
+            out = finish(grammar_output)
+        except BaseException as exc:
+            meter.error(exc)
+            raise
+        meter.end()
+        return out
 
     def check_perform_device_sampling(
         self,
@@ -3282,6 +4061,10 @@ class TTModelRunner:
         if max_lp is not None:
             if num_devices not in (8, 32):
                 return False
+            # A model whose device sampler returns no logprobs at all declares
+            # it; the device count alone does not make the sampler produce them.
+            if not self.model.model_capabilities.get("supports_device_logprobs", True):
+                return False
             if max_lp > 0 and not self.supports_topk_logprobs:
                 return False
 
@@ -3291,11 +4074,15 @@ class TTModelRunner:
         self,
         model_input: TTModelInput,
         batch_size_per_dp: list[int],
+        note_submitted: bool = True,
     ) -> Any:
         """Submit a prefill step and return the raw TT output.
 
         Launches TT prefill and returns the raw TT output used by the
-        synchronous extraction path.
+        synchronous extraction path. ``note_submitted=False``: a segment
+        of an open segmented chunk sent beside a decode step (the decode
+        rows' resident inputs are untouched, so the decode chain stays
+        valid; ``_segment_submit``).
         """
         kwargs = {
             "tokens": model_input.input_tokens,
@@ -3328,6 +4115,11 @@ class TTModelRunner:
                 for s in sampling_param_dict["seed"]
             ]
             kwargs["sampling_params"] = TTSamplingParams(**sampling_param_dict)
+            mask = model_input.intermediate_prefill_mask
+            if mask is not None and bool(mask.any()):
+                # only a supports_partial_prefill_sampling model gets here
+                # with intermediate rows (_prepare_model_inputs)
+                kwargs["sample_rows"] = [not bool(v) for v in mask.tolist()]
         # The slots go to the model whenever the build supplied them: a stateful
         # model's ``range(N)`` default clobbers live state, DP=1 included.
         empty_slots = model_input.prefill_empty_slots
@@ -3341,6 +4133,14 @@ class TTModelRunner:
                     empty_slots.append(dp_rank * stride + i)
         if empty_slots is not None:
             kwargs["empty_slots"] = list(empty_slots)
+        snap = getattr(model_input, "kda_snapshot_at", None)
+        if snap is not None:  # GLM53_KDA_CKPT_IN_REPLAY (only a kda_checkpoint_in_replay model gets here: from_runner)
+            kwargs["kda_snapshot_at"] = list(snap)
+        seg_rows = getattr(model_input, "segment_rows", None)
+        if seg_rows is not None:  # segtrace: the rows' segment of their one chunk (_segment_prepare)
+            kwargs["segment_rows"] = list(seg_rows)
+        else:
+            TTModelRunner._refuse_prefill_while_open(self)
 
         if self.request_specific_rope:
             tt_out, rope_deltas = self.model.prefill_forward(**kwargs)
@@ -3350,8 +4150,153 @@ class TTModelRunner:
             self.async_decode.note_prefill_submitted()
             return tt_out
         tt_out = self.model.prefill_forward(**kwargs)
-        self.async_decode.note_prefill_submitted()
+        if note_submitted:
+            self.async_decode.note_prefill_submitted()
         return tt_out
+
+    # -- segmented prefill traces (doc/ttnn/14b-persistent-stack/segtrace/runner_design.md section 4, item 10) -----
+    #
+    # The scheduler stamps every step of a segmented chunk (scheduler.set_tt_segment_step: req_id, segments,
+    # num_segments, end). Step 0 scheduled the chunk [s, e) minus its last token. The runner runs the row [s, e)'s
+    # segment 0, head-less, and keeps that input (after the connector's load: its kda_snapshot_at), the
+    # "same row" the model wants re-sent for every later segment. Each hold step re-sends it with the next segment
+    # BEFORE the step's decode. The release replaces the request's 1-token tail with it and runs every remaining
+    # segment, the last one with the head (the token of a final chunk). While the chunk is open, the request's state
+    # slot is pinned in the decode gather, and a request that leaves drops its open chunk (model.prefill_abort).
+
+    def _refuse_prefill_while_open(self) -> None:
+        """a whole-chunk prefill while a segmented chunk is open would overwrite its shared scratch (14 2026-10-27T09:16:21Z
+        MUST, the model refuses too): the scheduler never issues one; this names the bug before the device sees it"""
+        oc = getattr(getattr(self, "model", None), "open_chunk", None)
+        if callable(oc):
+            slot = oc()
+            if slot is not None:
+                raise RuntimeError(
+                    f"segtrace: a whole-chunk prefill was scheduled while slot {slot}'s segmented chunk is open "
+                    f"(runner open chunk: {getattr(self, '_segment_open', None) and self._segment_open['req_id']})"
+                )
+
+    @staticmethod
+    def _prefill_part(model_input: Any) -> Any:
+        if isinstance(model_input, TTMixedModelInput):
+            return model_input.prefill
+        return model_input if getattr(model_input, "prompt_lens", None) is not None else None
+
+    @staticmethod
+    def _with_prefill_part(model_input: Any, prefill: Any) -> Any:
+        if isinstance(model_input, TTMixedModelInput):
+            return replace(model_input, prefill=prefill)
+        return prefill
+
+    def _segment_round_up(self, pre: TTModelInput, req_id: str, end: int) -> TTModelInput:
+        """step 0 scheduled [s, e - 1); the device runs [s, e): the row's end -> e and its token history to e (the
+        persistent batch holds the prompt). The row stays head-less: segment 0 samples nothing (the release does)."""
+        row = list(pre.row_req_ids or []).index(req_id)
+        index = self.input_batch.req_id_to_index[req_id]
+        lens = pre.prompt_lens
+        if isinstance(lens, torch.Tensor):
+            lens = lens.clone()
+        elif isinstance(lens, np.ndarray):
+            lens = lens.copy()
+        else:
+            lens = list(lens)
+        lens[row] = end
+        tokens = pre.input_tokens
+        if tokens.shape[1] < end:
+            wide = torch.zeros((tokens.shape[0], end), dtype=tokens.dtype)
+            wide[:, : tokens.shape[1]] = tokens
+            tokens = wide
+        else:
+            tokens = tokens.clone()
+        tokens[row, :end] = self.input_batch.token_ids_cpu_tensor[index, :end]
+        mask = pre.intermediate_prefill_mask
+        mask = torch.zeros(len(lens), dtype=torch.bool) if mask is None else mask.clone()
+        mask[row] = True  # head-less at segment 0
+        return replace(pre, prompt_lens=lens, input_tokens=tokens, intermediate_prefill_mask=mask)
+
+    def _segment_prepare(self, scheduler_output: SchedulerOutput, model_input: Any) -> Any:
+        """the step's input under the scheduler's segment stamp (see the section comment); no stamp = unchanged"""
+        seg = get_tt_segment_step(scheduler_output)
+        if seg is None:
+            return model_input
+        rid, segs, n_seg, end = seg["req_id"], list(seg["segments"]), int(seg["num_segments"]), int(seg["end"])
+        open_ = getattr(self, "_segment_open", None)
+        pre = TTModelRunner._prefill_part(model_input)
+        rows = list(getattr(pre, "row_req_ids", None) or []) if pre is not None else []
+        if segs == [0] and rid in rows:  # step 0
+            if open_ is not None:
+                raise RuntimeError(f"segtrace: {rid}'s chunk starts while {open_['req_id']}'s is open")
+            if len(rows) != 1:
+                raise RuntimeError(f"segtrace: a segmented chunk must be its step's only prefill row: {rows}")
+            caps = getattr(self.model, "prefill_segments", None)
+            if not callable(caps):
+                raise RuntimeError(
+                    "segtrace: the scheduler segments chunks (tt.prefill_segments > 1) but the model has no "
+                    "prefill_segments(start, n)"
+                )
+            start = int(torch.as_tensor(pre.input_positions)[0])
+            s_model = int(caps(start, end - start))
+            if s_model != n_seg:
+                raise RuntimeError(
+                    f"segtrace: the scheduler cut the chunk [{start}, {end}) into {n_seg} segments, the model into "
+                    f"{s_model} (tt.prefill_segments vs the model's GLM53_PF_SEGMENTS)"
+                )
+            pre = replace(TTModelRunner._segment_round_up(self, pre, rid, end), segment_rows=[0])
+            slots = pre.prefill_empty_slots
+            self._segment_open = {"req_id": rid, "S": n_seg, "end": end, "input": None,
+                                  "slot": int(slots[0]) if slots else self._req_state_slot.get(rid)}  # fmt: skip
+            self.segment_chunks = getattr(self, "segment_chunks", 0) + 1
+            return TTModelRunner._with_prefill_part(model_input, pre)
+        if open_ is None or open_["req_id"] != rid or open_["input"] is None:
+            raise RuntimeError(f"segtrace: segments {segs} of {rid} stamped, but no recorded chunk of it is open")
+        stored = open_["input"]
+        if rid in rows:  # the release: the 1-token tail [e - 1, e) -> the remaining segments of [s, e)
+            if len(rows) != 1:
+                raise RuntimeError(f"segtrace: the release must be its step's only prefill row: {rows}")
+            for s in segs[:-1]:
+                TTModelRunner._segment_submit(self, stored, s)
+            index = self.input_batch.req_id_to_index[rid]
+            mask = torch.tensor([bool(open_["end"] < int(self.input_batch.num_tokens[index]))])
+            final = replace(stored, segment_rows=[segs[-1]], intermediate_prefill_mask=mask)
+            self._segment_open = None
+            self.segment_releases = getattr(self, "segment_releases", 0) + 1
+            return TTModelRunner._with_prefill_part(model_input, final)
+        for s in segs:  # a hold step: the segment goes before the step's decode (both on one command queue)
+            TTModelRunner._segment_submit(self, stored, s)
+        return model_input
+
+    def _segment_record(self, pre: Any) -> None:
+        """the open chunk's segment-0 input as the forward got it (after the connector's load: kda_snapshot_at)"""
+        open_ = getattr(self, "_segment_open", None)
+        if open_ is None or open_["input"] is not None or pre is None:
+            return
+        if getattr(pre, "segment_rows", None) == [0] and list(pre.row_req_ids or []) == [open_["req_id"]]:
+            open_["input"] = pre
+
+    def _segment_submit(self, stored: TTModelInput, s: int) -> None:
+        """a non-final segment of the open chunk: segment 0's row, segment s; the result is the head-less placeholder"""
+        batch = stored.unpadded_batch_size
+        TTModelRunner.submit_prefill(
+            self, replace(stored, segment_rows=[s]), batch if isinstance(batch, list) else [batch], note_submitted=False
+        )
+        self.segment_sends = getattr(self, "segment_sends", 0) + 1
+
+    def _segment_drop_if_gone(self, scheduler_output: SchedulerOutput) -> None:
+        """the open chunk's request finished / was preempted inside the hold: the model drops its open chunk"""
+        open_ = getattr(self, "_segment_open", None)
+        if open_ is None:
+            return
+        gone = set(scheduler_output.finished_req_ids) | set(getattr(scheduler_output, "preempted_req_ids", None) or ())
+        if open_["req_id"] not in gone:
+            return
+        abort = getattr(getattr(self, "model", None), "prefill_abort", None)
+        slot = self._req_state_slot.get(open_["req_id"], open_["slot"])
+        if callable(abort) and slot is not None:
+            abort(int(slot))
+        self._segment_open = None
+        self.segment_aborts = getattr(self, "segment_aborts", 0) + 1
+        logger.warning("segtrace: %s left inside its segmented chunk's hold: the open chunk at slot %s is dropped",
+                       open_["req_id"], slot)  # fmt: skip
 
     def _forward_with_model_input(
         self,

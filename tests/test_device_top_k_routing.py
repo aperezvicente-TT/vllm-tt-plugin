@@ -39,3 +39,33 @@ def test_top_k_routes_only_active_sampling_rows(cap, top_k, temperature):
     )
     expected = cap is None or temperature == 0 or 1 <= top_k <= cap
     assert TTModelRunner.check_perform_device_sampling(runner, True, False) is expected
+
+
+@pytest.mark.parametrize("declared", [None, True, False])
+@pytest.mark.parametrize("num_logprobs", [None, 0, 1])
+def test_logprob_requests_route_to_host_when_the_device_returns_none(
+    declared, num_logprobs
+):
+    """On an 8-device mesh a logprob request goes to the device sampler unless
+    the model declares that its sampler returns no logprobs."""
+    runner = SimpleNamespace(
+        sample_on_device_mode="all",
+        num_devices=8,
+        tt_data_parallel_size=1,
+        supports_topk_logprobs=False,
+        model=SimpleNamespace(
+            model_capabilities={}
+            if declared is None
+            else {"supports_device_logprobs": declared}
+        ),
+        model_config=SimpleNamespace(logits_processors=[]),
+        input_batch=SimpleNamespace(
+            sampling=SamplingInputBatch(4),
+            req_id_to_index={"only": 0},
+            no_penalties=True,
+            no_allowed_token_ids=True,
+            max_num_logprobs=num_logprobs,
+        ),
+    )
+    expected = num_logprobs is None or (num_logprobs == 0 and declared is not False)
+    assert TTModelRunner.check_perform_device_sampling(runner, True, False) is expected

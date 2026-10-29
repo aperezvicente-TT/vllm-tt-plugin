@@ -37,6 +37,8 @@ def _scheduler(*, running=(), waiting=0, skipped_waiting=0, mode):
         scheduler.skipped_waiting.add_request(object())
     scheduler.running = list(running)
     scheduler.max_num_running_reqs = 8
+    # vLLM 0.26 sets this in Scheduler.__init__ (the step's token budget); prefill-only steps read and restore it
+    scheduler.max_num_scheduled_tokens = 2048
     scheduler._forced_mode = mode
     # Production defaults; the decode-interleave cadence itself is covered in
     # tests/test_decode_interleave.py.

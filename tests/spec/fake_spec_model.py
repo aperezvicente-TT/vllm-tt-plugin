@@ -75,6 +75,8 @@ class FakeSpecModel:
     max_supported_num_seqs: int = 1
     accept_modes: tuple[str, ...] = (ACCEPT_MODE_ARGMAX_IDS, ACCEPT_MODE_LOGITS)
     drafter_state: str = DRAFTER_STATE_INTERNAL
+    # The plan's supports_narrow_decode (a knob: make_fake_spec_model).
+    supports_narrow_decode: bool = False
     extra_bytes_per_seq: int = 36 << 20
     extra_bytes_per_token: int = 1 << 10
     vocab_size: int = FAKE_VOCAB_SIZE
@@ -126,7 +128,7 @@ class FakeSpecModel:
             extra_bytes_per_token=cls.extra_bytes_per_token,
             accept_modes=cls.accept_modes,
             drafter_state=cls.drafter_state,
-            supports_narrow_decode=False,
+            supports_narrow_decode=cls.supports_narrow_decode,
         )
 
     # ---- the primitives --------------------------------------------------

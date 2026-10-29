@@ -29,7 +29,7 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
 
 from vllm_tt_plugin.scheduler import TTScheduler, spec_lookahead_tokens
-from vllm_tt_plugin.spec_admission import MODEL_OWNED_DRAFT_METHOD
+from vllm_tt_plugin.spec_admission import MODEL_OWNED_DRAFT_METHOD, MTP_DRAFT_METHOD
 from vllm_tt_plugin.spec_decode import (
     ACCEPT_MODE_ARGMAX_IDS,
     DRAFTER_STATE_INTERNAL,
@@ -206,6 +206,18 @@ def test_a_model_owned_drafter_reserves_the_anchor_and_every_draft():
         spec_lookahead_tokens(
             _plan(NUM_SPEC_TOKENS), NUM_SPEC_TOKENS, MODEL_OWNED_DRAFT_METHOD
         )
+        == NUM_SPEC_TOKENS + 1
+    )
+
+
+def test_an_mtp_launch_reserves_the_anchor_and_every_draft():
+    """``mtp`` is the same model-owned drafter on TT, writing the same K+1.
+
+    Upstream reserves ``K`` for ``mtp``, sized for its own proposer; the TT
+    scheduler takes the larger of the two.
+    """
+    assert (
+        spec_lookahead_tokens(_plan(NUM_SPEC_TOKENS), NUM_SPEC_TOKENS, MTP_DRAFT_METHOD)
         == NUM_SPEC_TOKENS + 1
     )
 

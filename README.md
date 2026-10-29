@@ -585,14 +585,15 @@ committed tokens to vLLM. The selected adapter must declare
 `supports_spec_decode=True` and return an admissible `SpecPlan` from
 `spec_plan`. Architecture registration alone does not enable speculation.
 
-Two drafting methods execute today:
+Three drafting methods execute today:
 
 | `speculative_config.method` | Proposal source | Required model implementation |
 | --- | --- | --- |
 | `ngram` | vLLM's host `NgramProposer` | `spec_plan` and multi-position verification; no model-side proposer |
 | `custom_class` | The selected adapter's `propose_draft_tokens` | `spec_plan`, multi-position verification and `device_propose` in `spec_requirements` |
+| `mtp` | The selected adapter's own MTP head, through `propose_draft_tokens` | As `custom_class`, plus `hidden_feed` in `spec_requirements` and a `spec_hidden_handoff`; `model` unset or the target checkpoint |
 
-Both methods currently use `argmax_ids` verification and host greedy
+All methods currently use `argmax_ids` verification and host greedy
 acceptance. `docs/install-vllm-tt.sh` installs `numba` for `NgramProposer`.
 The CPU sampled-acceptance helper exists in `spec_accept.py`, but
 `TTModelRunner` does not call it. `logits` and `fused_sample` execution,
@@ -709,7 +710,8 @@ clear error before anything reaches the device:
 - Tensor parallel and pipeline parallel execution are provided by the models
   internal implementation, not exposed at the vLLM level.
 - Speculative decoding supports greedy `argmax_ids` verification with `ngram`
-  or the model-owned `custom_class` drafter on a compatible tt-metal adapter.
+  or the model-owned `custom_class` or `mtp` drafter on a compatible tt-metal
+  adapter.
   See [Speculative Decoding](#speculative-decoding) for launch settings,
   model selection and sampling limits.
 - LoRA is not currently supported.

@@ -1,0 +1,19 @@
+# LMCache configuration for the Tenstorrent GLM-5.3-Flash serving path (A2, 2026-10-20).
+# Use: LMCACHE_CONFIG_FILE=<this file>  (see serve_lmcache_tt.sh). Page geometry: doc/ttnn/15-lmcache/page_contract.md.
+chunk_size: 128                 # 2 pages = the prefill chunk alignment / prefix-cache boundary (J11)
+local_cpu: true                 # tier 1: host RAM
+max_local_cpu_size: 32          # GiB (host-8chip: 157 GB RAM; 32 GiB holds ~2.8M tokens at 11,968 B/token)
+local_cpu_use_hugepages: false
+local_disk: "file:///opt/glm53/lmcache-disk/"   # tier 2: local NVMe (never NFS)
+max_local_disk_size: 100        # GB (root had ~137 GB free on 2026-10-20; resize to what is free)
+use_layerwise: false            # the TT connector is whole-chunk (layerwise needs a per-layer generator)
+save_decode_cache: false
+save_unfull_chunk: true         # the saved prefix is align64(len - 1) (contract §5): keep the partial last chunk
+enable_p2p: false
+extra_config:
+  # LMCache runs on a CPU-only torch here (torch_device_type == "cpu"): the device-side connector
+  # is supplied by the plugin (LMCache-tt lmcache/v1/gpu_connector/external.py).
+  gpu_connector: "vllm_tt_plugin.lmcache.connector:VLLMPagedMemTTConnector"
+  tt_tokens_per_page: 64
+  save_only_first_rank: false   # one worker process (TP8 is inside the plugin), nothing to dedupe
+  use_odirect: false

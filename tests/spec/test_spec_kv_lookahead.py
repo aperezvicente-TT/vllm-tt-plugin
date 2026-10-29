@@ -10,7 +10,8 @@ sit past the last position the step itself committed, so the step's own
 allocation does not cover them. ``Scheduler.__init__`` raises
 ``num_lookahead_tokens`` only for the drafter methods upstream recognises, and
 ``custom_class`` is not among them, which leaves a row that crosses into the
-next block with no block to land in.
+next block with no block to land in. A model's own MTP head is selected with
+``mtp``, which upstream does recognise, but reserves ``K`` for: one short.
 
 ``TTScheduler.__init__`` therefore raises ``num_lookahead_tokens`` to
 ``spec_lookahead_tokens(plan, K, method)``, and ``KVCacheManager.allocate_slots``
@@ -26,6 +27,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
 import torch
 from vllm.config import (
     CacheConfig,
@@ -49,10 +51,12 @@ from vllm.v1.request import Request, RequestStatus
 from vllm.v1.structured_output import StructuredOutputManager
 
 from vllm_tt_plugin.config import store_tt_spec_plan
+from vllm_tt_plugin.platform import _install_tt_mtp_speculative_config_patch
 from vllm_tt_plugin.scheduler import TTScheduler
 from vllm_tt_plugin.spec_admission import (
     MODEL_OWNED_DRAFT_METHOD,
     MODEL_OWNED_DRAFT_SENTINEL,
+    MTP_DRAFT_METHOD,
 )
 from vllm_tt_plugin.spec_decode import (
     ACCEPT_MODE_ARGMAX_IDS,
@@ -117,12 +121,15 @@ def _plan() -> SpecPlan:
     )
 
 
-def _scheduler(*, admitted: bool) -> TTScheduler:
+def _scheduler(
+    *, admitted: bool, method: str = MODEL_OWNED_DRAFT_METHOD
+) -> TTScheduler:
     """A real TTScheduler over a real KVCacheManager.
 
     ``admitted`` selects only whether a plan is published. The speculative
     flags are identical either way, so a difference in what the allocator
-    reserves is attributable to the plan and to nothing else.
+    reserves is attributable to the plan and to nothing else. ``method`` is
+    one of the model-owned drafter methods.
     """
     model_config = ModelConfig(
         model=str(LOCAL_MODEL_CONFIG),
@@ -157,9 +164,15 @@ def _scheduler(*, admitted: bool) -> TTScheduler:
         )
     # Attached after construction: the platform hook resolves a plan of its own
     # from the model class, and this stub declares no speculative capability.
+    if method == MTP_DRAFT_METHOD:
+        # TT's construction, which builds no draft model: upstream's refuses
+        # this target, a model type it ships no MTP drafter for.
+        _install_tt_mtp_speculative_config_patch()
+        method_kwargs = {"method": MTP_DRAFT_METHOD}
+    else:
+        method_kwargs = {"method": method, "model": MODEL_OWNED_DRAFT_SENTINEL}
     config.speculative_config = SpeculativeConfig(
-        method=MODEL_OWNED_DRAFT_METHOD,
-        model=MODEL_OWNED_DRAFT_SENTINEL,
+        **method_kwargs,
         num_speculative_tokens=NUM_SPEC_TOKENS,
         target_model_config=config.model_config,
         target_parallel_config=config.parallel_config,
@@ -245,6 +258,16 @@ def test_the_reserved_lookahead_is_the_anchor_and_every_draft():
     assert _scheduler(admitted=False).num_lookahead_tokens == 0
 
 
+def test_an_mtp_launch_reserves_the_same_extent():
+    """On TT ``mtp`` is the model's own MTP head, the same drafter writing the
+    same K+1 rows. Upstream does reserve for ``mtp``, but ``K``, sized for its
+    own proposer: one slot short without the plan."""
+    admitted = _scheduler(admitted=True, method=MTP_DRAFT_METHOD)
+    assert admitted.num_lookahead_tokens == WRITE_EXTENT
+    unadmitted = _scheduler(admitted=False, method=MTP_DRAFT_METHOD)
+    assert unadmitted.num_lookahead_tokens == NUM_SPEC_TOKENS
+
+
 def test_a_draftless_step_reserves_the_block_its_first_proposal_crosses_into():
     """The step after a prefill carries no drafts, and the proposal it makes
     still writes K+1 rows past the token it commits."""
@@ -272,10 +295,11 @@ def test_a_draftless_step_reserves_the_block_its_first_proposal_crosses_into():
     assert _blocks_for(computed + 1 + WRITE_EXTENT) == 2
 
 
-def test_a_fully_accepted_block_reserves_past_the_boundary_it_lands_on():
+@pytest.mark.parametrize("method", [MODEL_OWNED_DRAFT_METHOD, MTP_DRAFT_METHOD])
+def test_a_fully_accepted_block_reserves_past_the_boundary_it_lands_on(method):
     """Every draft committing puts the last committed position on a block
     boundary, and the next proposal writes K+1 rows past that."""
-    scheduler = _scheduler(admitted=True)
+    scheduler = _scheduler(admitted=True, method=method)
     # c = 58: this step computes its own sampled token at position 58 and the
     # K=5 drafts at 59 through 63, so full acceptance commits position 63, the
     # last position of block 0. The proposal that follows writes 64 through

@@ -278,7 +278,6 @@ def test_a_greedy_request_is_served_while_speculating(monkeypatch, vllm_config):
 @pytest.mark.parametrize(
     "field, value",
     [
-        ("logprobs", 1),
         ("min_tokens", 4),
         ("bad_words", ["no"]),
     ],
@@ -289,8 +288,8 @@ def test_a_request_the_greedy_walk_cannot_serve_is_refused(
     """Answering greedily anyway would change what was asked for, silently.
 
     The accept walk compares token ids and never sees logits, so it cannot
-    arbitrate a token filter or a penalty, and it cannot produce logprobs. Each
-    of those would come back plausible and wrong.
+    arbitrate a token filter or a penalty. Each of those would come back
+    plausible and wrong. (Logprobs are admitted: the next tests.)
 
     ``min_p``, ``top_p`` and ``top_k`` are absent from this list because vLLM
     neutralises them itself on a greedy request, so they can only arrive
@@ -336,6 +335,37 @@ def test_a_sampled_request_is_admitted_and_decoded_unspeculated(
     _validate(SamplingParams(**kwargs))  # must not raise
 
 
+@pytest.mark.parametrize("logprobs", [0, 5, 100])
+def test_a_logprobs_request_is_admitted_and_decoded_unspeculated(
+    monkeypatch, vllm_config, logprobs
+):
+    """Logprobs come from the ordinary decode's host sampler.
+
+    Refusing them failed a served launch's strict selftest (teacher-forced
+    top-5 via logprobs=100) on every prompt, so the server never bound. The
+    argmax_ids walk carries no logits, but the ordinary decode path computes
+    logprobs from the step's logits -- the values a plain launch returns -- so
+    the request is served there, without drafts.
+    """
+    from vllm.sampling_params import SamplingParams
+
+    model = make_fake_spec_model(max_supported_num_seqs=4, supports_narrow_decode=True)
+    _run_hook(monkeypatch, _speculative(vllm_config), model)
+    assert get_tt_spec_plan(vllm_config).supports_narrow_decode
+    _validate(SamplingParams(temperature=0.0, logprobs=logprobs))  # must not raise
+
+
+def test_logprobs_are_refused_when_every_step_is_a_verify(monkeypatch, vllm_config):
+    """Without supports_narrow_decode there is no ordinary decode to serve them."""
+    from vllm.sampling_params import SamplingParams
+
+    _speculating_platform(monkeypatch, vllm_config)
+    assert not get_tt_spec_plan(vllm_config).supports_narrow_decode
+    with pytest.raises(ValueError) as excinfo:
+        _validate(SamplingParams(temperature=0.0, logprobs=5))
+    assert "logprobs" in str(excinfo.value)
+
+
 def test_a_request_is_unrestricted_when_nothing_speculates(monkeypatch, vllm_config):
     """The gate is speculation's, not the backend's."""
     from vllm.sampling_params import SamplingParams
@@ -351,11 +381,23 @@ def test_a_request_is_unrestricted_when_nothing_speculates(monkeypatch, vllm_con
 
 
 class _FakeBatch:
-    def __init__(self, random=(), presence=(), frequency=(), repetition=()):
+    def __init__(self, random=(), presence=(), frequency=(), repetition=(), logprobs=()):
+        import torch
+
+        from vllm_tt_plugin.input_batch import LOGPROBS_NONE_SENTINEL
+
         self.random_reqs = set(random)
         self.presence_penalties_reqs = set(presence)
         self.frequency_penalties_reqs = set(frequency)
         self.repetition_penalties_reqs = set(repetition)
+        # the persistent batch's logprobs record: rows of r0 and of another
+        # request, the sentinel where none were asked for
+        self.req_id_to_index = {"r0": 0, "other": 1}
+        self.sampling = SimpleNamespace(
+            num_logprobs=torch.tensor(
+                [5 if r in set(logprobs) else LOGPROBS_NONE_SENTINEL for r in ("r0", "other")]
+            )
+        )
 
 
 def _speculable(**batch_kwargs):
@@ -395,6 +437,15 @@ def test_sampling_the_walk_cannot_certify_is_not_speculable(batch_kwargs):
 def test_another_request_being_sampled_does_not_block_this_one():
     """The gate is per request: a mixed batch still speculates where it can."""
     assert _speculable(random=["other"]) is True
+
+
+def test_a_logprobs_request_is_not_speculable():
+    """Its logprobs come from the ordinary decode, which the walk would skip."""
+    assert _speculable(logprobs=["r0"]) is False
+
+
+def test_another_request_asking_for_logprobs_does_not_block_this_one():
+    assert _speculable(logprobs=["other"]) is True
 
 
 def _publish(tokens, **batch_kwargs):

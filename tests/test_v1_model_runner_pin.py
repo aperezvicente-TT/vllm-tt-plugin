@@ -60,6 +60,10 @@ def test_upstream_still_honors_the_v2_env_knob():
     """
     import vllm.envs as envs
 
+    # an in-process engine earlier in the session (tests/lmcache/test_real_engine_join.py) enables vLLM's env cache;
+    # this test reads the knob's parsing, not a cached value
+    if hasattr(envs, "disable_envs_cache"):
+        envs.disable_envs_cache()
     os.environ[_V2_MODEL_RUNNER_ENV] = "0"
     assert envs.VLLM_USE_V2_MODEL_RUNNER is False
 

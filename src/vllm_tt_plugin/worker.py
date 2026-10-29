@@ -34,6 +34,10 @@ from vllm_tt_plugin.config import (
     get_tt_per_lane_max_num_seqs,
     is_tt_block_output_model,
 )
+from vllm_tt_plugin.kv_connector import (
+    ensure_tt_kv_transfer_initialized,
+    ensure_tt_kv_transfer_shutdown,
+)
 from vllm_tt_plugin.logger import init_tt_logger
 from vllm_tt_plugin.model_runner import TTModelRunner
 from vllm_tt_plugin.platform import (
@@ -219,6 +223,15 @@ class TTWorker(WorkerBase):
             self.enable_model_warmup = tt_config[enable_model_warmup_key]
 
     def init_device(self) -> None:
+        # A spawned engine process has not run the platform's config hooks:
+        # install the bounded drain here, in the process that owns the mesh.
+        from vllm_tt_plugin.drain import install_engine_drain_patch
+
+        install_engine_drain_patch()
+        # v3b5: the engine process's GC policy (thresholds, idle refreeze, per-generation pause accounting)
+        from vllm_tt_plugin import gc_tuning
+
+        gc_tuning.install()
         # tt-metal latches the visible set at first cluster construction and never
         # re-reads the env var, so bind before `check_and_update_config` ->
         # `get_model_architecture` imports the tt-metal model module.
@@ -274,6 +287,7 @@ class TTWorker(WorkerBase):
             enable_model_warmup=self.enable_model_warmup,
             num_devices=self.num_devices,
         )
+        self.model_runner._on_device_fault = self._close_mesh_after_fault
 
     def load_model(self):
         self.model_runner.load_model()
@@ -289,6 +303,33 @@ class TTWorker(WorkerBase):
 
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         return self.model_runner.get_supported_tasks()
+
+    def get_kv_connector_handshake_metadata(
+        self,
+    ) -> dict[tuple[int, int], Any] | None:
+        """KV connector handshake metadata of this (single) rank.
+
+        vLLM's EngineCore asks every worker for it whenever a
+        ``kv_transfer_config`` is set (join finding J6); the GPU worker's
+        shape, keyed ``(pp_rank, tp_rank)``, which on TT is the single-process
+        group's ``(0, 0)``. ``None`` without a connector or when the connector
+        has nothing to hand over (LMCache, ExampleConnector).
+        """
+        from vllm.distributed.kv_transfer import (
+            get_kv_transfer_group,
+            has_kv_transfer_group,
+        )
+
+        if not has_kv_transfer_group():
+            return None
+        metadata = get_kv_transfer_group().get_handshake_metadata()
+        if metadata is None:
+            return None
+        from vllm.distributed import parallel_state as ps
+
+        pp_rank = ps._PP.rank_in_group if ps._PP is not None else 0
+        tp_rank = ps._TP.rank_in_group if ps._TP is not None else 0
+        return {(pp_rank, tp_rank): metadata}
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         """
@@ -440,6 +481,9 @@ class TTWorker(WorkerBase):
         Every standard-DP rank owns its own TT mesh/KV cache, while
         single-process lane mode has only one rank.
         """
+        # The worker-side KV connector needs ``kv_cache_config`` and must exist
+        # before the runner registers the paged caches with it.
+        ensure_tt_kv_transfer_initialized(self.vllm_config, kv_cache_config)
         self.model_runner.initialize_kv_cache(kv_cache_config)
 
     def update_max_model_len(self, max_model_len: int) -> None:
@@ -497,8 +541,12 @@ class TTWorker(WorkerBase):
         return self.model_runner.sample_tokens(grammar_output)
 
     def check_health(self) -> None:
-        # Worker will always be healthy as long as it's running.
-        return
+        """Healthy until a device step fails; then raise the latched fault so
+        vLLM's health probe reports the engine dead instead of silently idle."""
+        runner = getattr(self, "model_runner", None)
+        check = getattr(runner, "check_health", None)
+        if callable(check):
+            check()
 
     def shutdown(self) -> None:
         """Release model-owned captures and close the mesh before exit.
@@ -512,14 +560,25 @@ class TTWorker(WorkerBase):
         resetting the board").
         """
         runner = getattr(self, "model_runner", None)
+        # The store worker's queued stores land while the model's page-DMA is still open (the runner's release closes
+        # it): a P3 zero-copy store job reads the pages through it.
+        try:
+            from vllm_tt_plugin.kv_connector import drain_store_workers  # noqa: PLC0415
+
+            drain_store_workers()
+        except Exception:  # noqa: BLE001 - never block the mesh close
+            logger.exception("TT: draining the KV store workers before the model release failed")
         if runner is not None:
             runner.shutdown()
+        # Connector first: its async saves may still read device pages.
+        ensure_tt_kv_transfer_shutdown()
         mesh_device = getattr(self, "mesh_device", None)
         if mesh_device is not None:
             close_mesh_device(mesh_device, get_tt_config(self.vllm_config))
             # Idempotence: __del__ (and a second shutdown call) must not
             # close the mesh again.
             self.mesh_device = None
+            _mark_mesh_closed()
         # Release the process-level admission handle when it points at this
         # engine's config, so an in-process successor engine is admitted
         # without waiting for garbage collection to clear the weakref.
@@ -529,6 +588,15 @@ class TTWorker(WorkerBase):
             and TTPlatform._resolve_tt_admission_handle() is vllm_config
         ):
             TTPlatform._tt_vllm_config = None
+
+    def _close_mesh_after_fault(self, exc: BaseException) -> None:
+        """A device step faulted (the runner latched it): release the captures and close the mesh now, before the
+        engine core reports itself dead and the API process terminates it (the signal would otherwise interrupt the
+        finally-shutdown with the mesh open). Idempotent with ``shutdown``."""
+        logger.error(
+            "TT: closing the mesh after the latched device fault (%s)", type(exc).__name__
+        )
+        self.shutdown()
 
     # ---- Destructor (used to close devices) ----
 
@@ -886,6 +954,18 @@ def open_mesh_device(
         mesh_grid,
     )
     return mesh_device
+
+
+def _mark_mesh_closed() -> None:
+    """Record that this process closed its mesh (drain.mesh_close_marker): the API process's exit report reads it."""
+    from vllm_tt_plugin.drain import mesh_close_marker  # noqa: PLC0415
+
+    path = mesh_close_marker(os.getpid())
+    try:
+        with open(path, "w") as f:
+            f.write(f"{time.time():.3f}\n")
+    except OSError as e:
+        logger.warning("TT: cannot write the mesh-close marker %s (%s)", path, e)
 
 
 def close_mesh_device(mesh_device, tt_config):

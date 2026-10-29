@@ -18,12 +18,13 @@ Plugin `main` includes configuration admission, candidate construction, greedy
 acceptance and model-owned proposals. A model implementing this contract can
 serve speculative decoding within the following execution limits:
 
-- two drafting methods: **`ngram`**, which runs on the host and needs no
+- three drafting methods: **`ngram`**, which runs on the host and needs no
   model-side proposer (the target still implements `spec_plan` and verification),
-  and **`custom_class`**, which is the model's own drafter
-  proposing on device through `propose_draft_tokens`. Every other method vLLM
-  knows is refused at configuration time rather than admitted to draft
-  nothing.
+  **`custom_class`**, which is the model's own drafter
+  proposing on device through `propose_draft_tokens`, and **`mtp`**, which is
+  the model's own MTP head through that same model-owned drafter contract
+  (section 4b). Every other method vLLM knows is refused at configuration time
+  rather than admitted to draft nothing.
 - the **`argmax_ids`** accept mode, and no other. A plan offering only `logits`
   is refused, because `TTModelRunner` requests `argmax_ids` on every verification
   step. An ordinary narrow decode does not send `spec_mode`.
@@ -408,6 +409,37 @@ instead recognizes the fixed marker and calls the loaded model adapter; the TT
 runner does not import `vllm_tt_plugin.model_owned_drafter` or load a separate
 draft checkpoint from that value.
 
+### Method `mtp`: the model's own MTP head
+
+vLLM's `mtp` method selects the same model-owned drafter. A target whose
+checkpoint carries a Multi-Token Prediction head drafts with it on device:
+the runner verifies with `decode_forward(..., spec_mode="argmax_ids")` and
+proposes with `propose_draft_tokens`, exactly as above. No upstream proposer
+is imported or constructed and no draft checkpoint is loaded:
+
+```text
+--speculative-config '{"method": "mtp", "num_speculative_tokens": K}'
+```
+
+- `mtp` requires `device_propose` and `hidden_feed`, because an MTP head
+  reads the target hidden state, so the model also declares
+  `spec_hidden_handoff` (normally `["on_device"]`). `custom_class` requires
+  only `device_propose`.
+- `model` may be left unset, which vLLM resolves to the target checkpoint, or
+  name the target checkpoint. Admission refuses any other value: it would name
+  draft weights that are never loaded.
+- Upstream `SpeculativeConfig` would build a draft `ModelConfig` from the
+  target checkpoint and raise `NotImplementedError` for a model type it ships
+  no MTP drafter for. On the TT platform,
+  `_install_tt_mtp_speculative_config_patch` builds `mtp` the way upstream
+  builds `custom_class` instead: the target's model and parallel configs stand
+  in for the draft ones.
+- Upstream's asynchronous-scheduling gate admits `mtp` by itself and selects
+  async by default, so a model declaring `supports_async_decode` without
+  `supports_async_spec_decode` is refused unless launched with
+  `--no-async-scheduling` (section 4c). The KV reservation is the model-owned
+  drafter's `K + 1` (section 4f).
+
 ## 4c. The verify call under asynchronous scheduling
 
 `supports_async_decode` and `supports_async_spec_decode` are separate model
@@ -442,7 +474,8 @@ these checks in this order:
    but do not replace the other admission checks.
 
 `_install_tt_async_spec_method_patch` admits `custom_class` through the upstream
-async method check before platform validation. TT plugin bootstrap installs
+async method check before platform validation. `mtp` needs no patch: upstream
+already admits it. TT plugin bootstrap installs
 `_install_tt_async_spec_method_patch` in each TT process, including engine-core
 processes. The patch preserves the dispatch marker and capability checks.
 If the installed vLLM implementation has an unrecognized async admission check,
@@ -701,7 +734,7 @@ no accepted count for a request whose slot a preemption already released.
 `spec_lookahead_tokens(get_tt_spec_plan(vllm_config), self.num_spec_tokens,
 speculative_config.method)`, and `spec_lookahead_tokens` returns
 `num_spec_tokens + 1` when a `SpecPlan` was admitted, `num_spec_tokens` is
-positive, and `speculative_config.method` is `custom_class`. An
+positive, and `speculative_config.method` is `custom_class` or `mtp`. An
 `ngram` launch also carries an admitted plan, but its drafts come from the
 plugin and its target verifies them inside the step's own allocation, so
 `spec_lookahead_tokens` returns zero for `ngram`. `TTScheduler.__init__` uses
@@ -717,6 +750,8 @@ step's own allocation covers. Upstream vLLM reserves lookahead only for the
 drafter methods it knows, and `custom_class` is not one of them, so without
 this reservation the rows that cross into the next block land in the null
 block and the first token that reads them diverges from an ordinary decode.
+Upstream does reserve for `mtp`, but `K`, sized for its own proposer, one
+short of what the model-owned drafter writes.
 
 `K + 1` is the demonstrated bound for the drafter implementation this was
 measured against. It is not a proof about every adapter. An adapter whose

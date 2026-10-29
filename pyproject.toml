@@ -39,9 +39,18 @@ tt_model_registry = "vllm_tt_plugin.entrypoints:register"
 [project.entry-points."vllm.platform_plugins"]
 tt = "vllm_tt_plugin.entrypoints:platform_plugin"
 
+# GLM-5.3-Flash startup self-test (src/vllm_tt_plugin/selftest/). vLLM loads
+# endpoint plugins only when VLLM_PLUGINS names them; the PYTHONPATH-first
+# serving trees get it from _install_glm53_selftest_endpoint_patch instead.
+[project.entry-points."vllm.endpoint_plugins"]
+glm53_selftest = "vllm_tt_plugin.selftest.endpoint:create_plugin"
+
 [tool.setuptools.packages.find]
 where = ["src"]
 include = ["vllm_tt_plugin*"]
+
+[tool.setuptools.package-data]
+"vllm_tt_plugin.selftest" = ["goldens/*.json"]
 
 # Linting aligned to upstream vLLM rules
 [tool.ruff.lint]

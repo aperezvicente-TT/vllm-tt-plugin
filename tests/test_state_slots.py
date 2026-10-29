@@ -151,6 +151,32 @@ def test_state_follows_the_request_across_row_moves():
     )
 
 
+def test_a_chunked_prefill_continuation_keeps_the_slot_holding_its_state():
+    """A request between prompt chunks owns live state (its recurrent/conv state
+    after the chunks so far). Its next chunk is prefilled at whatever row vLLM
+    re-adds it to, which need not be its slot; the continuation must still run
+    in the slot that holds its state, not in a fresh one."""
+    r = _runner()
+    state: list[str | None] = [None] * SLOTS
+    # A finishes its prompt; B and C are mid-prompt (chunked prefill).
+    for row, slot in enumerate(_prefill(r, ["A", "B", "C"])):
+        state[slot] = ["A", "B", "C"][row]
+    # A decodes alone; B and C stay off-batch.
+    state = _gather(state, _decode(r, ["A"]))
+    # B is cancelled between its chunks: slot 1 becomes free.
+    _release(r, finished={"B"})
+    r.requests.pop("B")
+    state[1] = None
+
+    # C's next chunk is the only prefill row (row 0, which A's slot holds).
+    (slot,) = _prefill(r, ["C"])
+    assert state[slot] == "C", (
+        f"C's continuation was placed in slot {slot}, which holds {state[slot]!r}; "
+        f"C's state is in slot {state.index('C')}"
+    )
+    _assert_state_found(r, state)
+
+
 def test_accepting_the_decode_remap_advances_the_ownership_map():
     """An accepted decode records the post-gather layout.
 

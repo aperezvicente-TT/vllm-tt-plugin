@@ -4,10 +4,11 @@
 """Per-step input payloads handed from ``TTModelRunner`` to the TT model.
 
 ``TTModelInput`` is the prebuilt input for one execution step (prefill or
-decode); ``TTSamplingParams`` carries the sampling tensors/lists that ride
-along with it. Both are plain frozen dataclasses with no execution logic so
-the runner, the lane executor, and the async decode controller can share them
-without importing the runner.
+decode); a mixed prefill+decode step carries one of each in a
+``TTMixedModelInput``. ``TTSamplingParams`` carries the sampling tensors/lists
+that ride along with them. All are plain frozen dataclasses with no execution
+logic so the runner, the lane executor, and the async decode controller can
+share them without importing the runner.
 """
 
 from __future__ import annotations
@@ -173,6 +174,16 @@ class TTModelInput:
     # single-process DP (supplied by the scheduler-owned step plan), local otherwise.
     prefill_empty_slots: list[int] | None = None
 
+    # Prefill-only (GLM53_KDA_CKPT_IN_REPLAY): per row, the absolute position whose KDA state the replay snapshots into
+    # the model's staging buffers (the prompt's checkpoint cut), 0 = none; None when no row has one. Set by the KV
+    # connector host before the forward (TTKVConnectorHost._mark_kda_snapshots).
+    kda_snapshot_at: list[int] | None = None
+
+    # Prefill-only (segmented prefill traces, doc/ttnn/14b-persistent-stack/segtrace/runner_design.md section 4): per
+    # row, the segment of the row's ONE chunk this call runs (None = the whole chunk); None when no row is segmented.
+    # Set by the runner from the scheduler's set_tt_segment_step stamp (TTModelRunner._segment_prepare).
+    segment_rows: list[int | None] | None = None
+
     # Decode-only, speculation only. ``draft_token_ids`` is ``[B, K]``, the
     # drafts the block's columns 1..K carry, kept alongside the block because
     # the accept walk needs them again after the verify returns. ``spec_mode``
@@ -215,3 +226,21 @@ class TTModelInput:
     # Immutable row identity used for sample-time grammar remapping. Includes
     # padding/gap rows as None and is never reconstructed from a mutable batch.
     grammar_row_req_ids: tuple[str | None, ...] = ()
+
+
+@dataclass(frozen=True)
+class TTMixedModelInput:
+    """The two device inputs of one mixed prefill+decode step.
+
+    Each part is an ordinary single-kind ``TTModelInput`` over its own rows of
+    the persistent batch (``row_req_ids`` names them), so it reaches the model
+    through the call a single-kind step of that kind would make: the prefill
+    part through ``prefill_forward``, the decode part through
+    ``decode_forward``. ``req_ids`` is the step's whole batch in batch order,
+    captured at build time: the step's output is laid out over it, and the
+    persistent batch may have moved on by the time the step is sampled.
+    """
+
+    prefill: TTModelInput
+    decode: TTModelInput
+    req_ids: tuple[str, ...]

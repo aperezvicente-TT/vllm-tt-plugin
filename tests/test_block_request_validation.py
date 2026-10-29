@@ -20,8 +20,8 @@ from vllm_tt_plugin.config import (
 from vllm_tt_plugin.platform import (
     TTPlatform,
     _fit_block_output_max_tokens,
-    _install_block_output_input_processor_patch,
     _install_block_output_streaming_input_patch,
+    _install_tt_input_processor_patch,
 )
 
 
@@ -82,7 +82,7 @@ def _patch_upstream_boundary(monkeypatch):
 def _processor_harness(monkeypatch, *, output_size=256, max_model_len=1024):
     """Install the vLLM 0.25.1 validate -> clone -> default boundary."""
     input_processor = _patch_upstream_boundary(monkeypatch)
-    _install_block_output_input_processor_patch()
+    _install_tt_input_processor_patch()
 
     config = _set_platform_contract(
         monkeypatch,

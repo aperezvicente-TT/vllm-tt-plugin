@@ -20,6 +20,17 @@ _TT_PLATFORM_CONFIG_ATTRS = (
 
 
 @pytest.fixture(autouse=True)
+def isolated_plan_check():
+    """the model's prefill plan check is process state (vllm_tt_plugin.plan_check, registered by the model runner at
+    load): a test that loads a runner left its mock model's check registered for every later test (9's 2026-10-27
+    05:00Z suite: 6 test_decode_interleave failures in a combined run, 33 / 33 alone). Cleared after every test."""
+    from vllm_tt_plugin import plan_check
+
+    yield
+    plan_check.register(None)
+
+
+@pytest.fixture(autouse=True)
 def reset_tt_platform_class_state():
     # Deferred: importing the platform from conftest runs before vLLM has
     # finished resolving its platform plugins, and that import is circular.

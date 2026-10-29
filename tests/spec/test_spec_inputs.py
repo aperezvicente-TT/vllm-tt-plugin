@@ -771,3 +771,18 @@ def test_the_runner_only_truncates_a_proposal_before_the_verify():
     )
     assert runner._drafts_to_verify(reserved, ["a", "b"]) == {"a": [21, 22, 23]}
     assert runner._proposed_draft_token_ids == {}
+
+
+def test_a_finished_request_is_not_speculable() -> None:
+    """A request the runner no longer holds (it finished before the completed
+    step that produced its last token was applied: async scheduling) is never
+    drafted for, even though it has also left the batch's sampling sets (a
+    sampled request would otherwise read as greedy). Stage 17, the k4b twins'
+    engine deaths of 2026-10-27."""
+    runner = SimpleNamespace(input_batch=SimpleNamespace(), requests={"live": object()})
+    gate = TTModelRunner._request_is_speculable.__get__(runner)
+    assert gate("live") is True
+    assert gate("finished") is False
+    # a runner without a requests table keeps the batch-only answer
+    bare = SimpleNamespace(input_batch=SimpleNamespace())
+    assert TTModelRunner._request_is_speculable.__get__(bare)("any") is True

@@ -16,20 +16,24 @@ from vllm.platforms.interface import Platform, PlatformEnum
 from vllm.utils import length_from_prompt_token_ids_or_embeds
 
 from vllm_tt_plugin.config import (
+    check_tt_request_context_limit,
     get_tt_config,
     get_tt_data_parallel_size,
     get_tt_decode_interleave_config,
     get_tt_max_batch_size,
     get_tt_output_tokens_per_step,
+    get_tt_request_context_limit,
     get_tt_spec_plan,
     is_tt_adaptive_block_output_model,
     is_tt_block_output_model,
     require_tt_output_tokens_per_step,
+    resolve_tt_request_context_limit,
     store_tt_adaptive_block_max_prompt_tokens,
     store_tt_adaptive_block_output,
     store_tt_block_kv_extent_tokens,
     store_tt_lane_count,
     store_tt_output_tokens_per_step,
+    store_tt_request_context_limit,
     store_tt_spec_plan,
     store_tt_supports_device_grammar,
     uses_tt_lane_coordinator,
@@ -38,6 +42,9 @@ from vllm_tt_plugin.config import (
 from vllm_tt_plugin.logger import init_tt_logger
 from vllm_tt_plugin.spec_admission import (
     MODEL_OWNED_DRAFT_METHOD,
+    DFLASH_DRAFT_METHOD,
+    DFLASH_DRAFTER_ID,
+    MTP_DRAFT_METHOD,
     resolve_speculative_plan,
 )
 from vllm_tt_plugin.utils.dp_discovery import (
@@ -665,6 +672,111 @@ def _install_api_lifespan_gc_patch() -> None:
             module.lifespan = lifespan
 
 
+def _install_glm53_selftest_endpoint_patch() -> None:
+    """Run the GLM-5.3-Flash serving self-test before the API server binds.
+
+    vLLM loads ``vllm.endpoint_plugins`` only when ``VLLM_PLUGINS`` names
+    them, and the program's serving trees run this plugin from PYTHONPATH
+    without reinstalling its entry points. Append the self-test plugin to
+    ``load_endpoint_plugins`` so ``init_app_state`` runs it (strict TF rank
+    check + greedy smoke; GLM53_SELFTEST=strict|warn|off) on every launch.
+    It skips itself for models the goldens pack does not describe.
+    """
+    from vllm_tt_plugin.selftest.endpoint import install_endpoint_patch
+
+    install_endpoint_patch()
+
+
+# Exit status of the API server process once the engine core died (a device
+# step raised): distinct from 0 (orderly) and from signal deaths, so a launcher
+# can tell "the device faulted" from "stopped". 70 = sysexits EX_SOFTWARE.
+TT_ENGINE_DEAD_EXIT_CODE = 70
+
+
+def _tt_engine_died(engine) -> bool:
+    """Did the engine core die (as opposed to closing after a drain)?
+
+    ``engine_client.errored`` is no answer: it is True after every
+    ``AsyncLLM.shutdown`` (the output handler is cancelled), so an orderly
+    drain whose HTTP stream outlived the engine shutdown exited 70. Decide on
+    the engine's own death report (``resources.engine_dead``: ENGINE_CORE_DEAD
+    or the liveness monitor) and on the engine process's exit status recorded
+    after the process-manager join (vllm_tt_plugin.drain).
+    """
+    if engine is None:
+        return False
+    from vllm_tt_plugin.drain import abnormal_engine_exit
+
+    if abnormal_engine_exit():
+        return True
+    resources = getattr(getattr(engine, "engine_core", None), "resources", None)
+    if resources is not None:
+        return bool(getattr(resources, "engine_dead", False))
+    return bool(getattr(engine, "errored", False))
+
+
+def _install_tt_drain_patches() -> None:
+    """Bounded drain in the engine process, exit reporting in the API process
+    (vllm_tt_plugin.drain). Idempotent; both halves are installed in every
+    process that reaches a TT hook (a forked engine inherits them, a spawned
+    one installs them again from TTWorker)."""
+    from vllm_tt_plugin.drain import install_api_drain_patches, install_engine_drain_patch
+
+    install_engine_drain_patch()
+    install_api_drain_patches()
+
+
+def _install_tt_engine_death_exit_patch() -> None:
+    """Exit the API server non-zero when the engine core died.
+
+    Upstream's watchdog stops uvicorn when ``engine.errored`` (the engine core
+    process re-raised a step exception and exited), but ``run_server`` then
+    returns normally and ``vllm serve`` exits 0: a device fault looks like an
+    orderly stop to the launcher, which may restart and re-open the devices.
+    Wrap ``serve_http`` so the shutdown it hands back raises
+    ``SystemExit(TT_ENGINE_DEAD_EXIT_CODE)`` after the orderly HTTP shutdown
+    when the engine client errored. The engine core itself already exits
+    non-zero (``EngineCoreProc.run_engine_core`` re-raises) after
+    ``TTWorker.shutdown`` closed the mesh once; nothing retries the step.
+    """
+    import vllm.entrypoints.launcher as launcher
+
+    original = launcher.serve_http
+    if getattr(original, "_tt_engine_death_exit_patch", False):
+        return
+
+    @wraps(original)
+    async def serve_http(app, sock, enable_ssl_refresh=False, **uvicorn_kwargs):
+        # Read the client before serving: the lifespan cleanup drops ``app.state``.
+        engine = getattr(getattr(app, "state", None), "engine_client", None)
+        shutdown = await original(
+            app, sock, enable_ssl_refresh=enable_ssl_refresh, **uvicorn_kwargs
+        )
+        if not _tt_engine_died(engine):
+            return shutdown
+
+        async def exit_engine_dead():
+            try:
+                await shutdown
+            finally:
+                logger.error(
+                    "TT engine core died (a device step failed); API server "
+                    "exiting with status %d",
+                    TT_ENGINE_DEAD_EXIT_CODE,
+                )
+            raise SystemExit(TT_ENGINE_DEAD_EXIT_CODE)
+
+        return exit_engine_dead()
+
+    serve_http._tt_engine_death_exit_patch = True
+    launcher.serve_http = serve_http
+    # api_server imported the function by name before the platform hook ran.
+    for name in ("vllm.entrypoints.openai.api_server", "__main__"):
+        module = sys.modules.get(name)
+        if module is not None and getattr(module, "serve_http", None) is original:
+            module.serve_http = serve_http
+
+
 def _install_torch_accelerator_cleanup_patch() -> None:
     """Make process-wide cache release safe with TT's CPU-only Torch runtime.
 
@@ -910,6 +1022,89 @@ def _uninstall_tt_async_spec_method_patch() -> None:
     del vllm_config_module._tt_original_eagle_model_types
 
 
+def _install_tt_mtp_speculative_config_patch() -> None:
+    """Build vLLM's ``mtp`` speculative config without an upstream drafter.
+
+    On TT, ``mtp`` means the loaded model's own MTP head, proposing on device
+    through ``propose_draft_tokens``: the model-owned drafter contract that
+    ``custom_class`` also selects. Upstream ``SpeculativeConfig.__post_init__``
+    instead defaults ``model`` to the target checkpoint, builds a second
+    ``ModelConfig`` from it with ``runner="draft"``, and rewrites that config's
+    HF config into one of the MTP drafter architectures vLLM ships. For a target
+    type it has no MTP architecture for (``glm5_next`` in vLLM 0.26) it then
+    raises ``NotImplementedError: Unsupported speculative method: 'mtp'``.
+    Nothing on TT would load that draft model in any case.
+
+    The replacement builds an MTP method the way upstream builds
+    ``custom_class``: no draft model, and the target's model and parallel
+    configs stand in for the draft ones. ``model`` still defaults to the target
+    checkpoint, as upstream defaults it, and a deprecated MTP alias is still
+    rewritten to ``mtp``. Every other method, and an MTP config built without a
+    target, keeps upstream's ``__post_init__``. Whether the model may serve the
+    method, and whether ``model`` names anything other than the target, is the
+    plugin's admission decision (``resolve_speculative_plan``).
+
+    Installed only when TT is the active platform, because on any other
+    platform the same method has to build the upstream drafter. Installed from
+    the TT platform hooks (``pre_register_and_update`` is the first statement
+    of ``EngineArgs.create_engine_config``, which builds the
+    ``SpeculativeConfig``), and from the general-plugin entry point for a
+    ``SpeculativeConfig`` built outside that call.
+
+    TODO: remove this once vLLM lets a platform own the MTP drafter.
+    """
+    from vllm.platforms import current_platform
+
+    if not isinstance(current_platform, TTPlatform):
+        return
+
+    from vllm.config.speculative import MTPModelTypes, SpeculativeConfig
+
+    original = SpeculativeConfig.__post_init__
+    if getattr(original, "_tt_mtp_model_owned_drafter", False):
+        return
+    mtp_methods = get_args(MTPModelTypes)
+    # ``dflash`` too: upstream builds a draft ModelConfig from 'model' (the
+    # drafter checkpoint, an HF fetch). On TT the loaded target runs the
+    # Apache-2.0 DFlash2 drafter inside its own decode step (GLM53_SPEC_KIND=
+    # dflash2; weights from GLM53_DF2_DIR), so no draft model is built and the
+    # method keeps vLLM's name (its scheduler keys lookahead on EagleModelTypes).
+    taken = (*mtp_methods, DFLASH_DRAFT_METHOD)
+
+    @wraps(original)
+    def __post_init__(self):
+        if self.method not in taken or self.target_model_config is None:
+            return original(self)
+        if self.method == DFLASH_DRAFT_METHOD:
+            if self.model is None:
+                self.model = DFLASH_DRAFTER_ID
+        else:
+            if self.method != MTP_DRAFT_METHOD:
+                logger.warning(
+                    "method `%s` is deprecated and replaced with mtp.", self.method
+                )
+                self.method = MTP_DRAFT_METHOD
+            if self.model is None:
+                self.model = self.target_model_config.model
+        self.prompt_lookup_max = 0
+        self.prompt_lookup_min = 0
+        self.draft_model_config = self.target_model_config
+        self.draft_parallel_config = self.target_parallel_config
+        return self
+
+    __post_init__._tt_mtp_model_owned_drafter = True
+    SpeculativeConfig.__post_init__ = __post_init__
+
+
+def _uninstall_tt_mtp_speculative_config_patch() -> None:
+    """Restore upstream's construction, for tests that assert the unpatched one."""
+    from vllm.config.speculative import SpeculativeConfig
+
+    current = SpeculativeConfig.__post_init__
+    if getattr(current, "_tt_mtp_model_owned_drafter", False):
+        SpeculativeConfig.__post_init__ = current.__wrapped__
+
+
 def _pin_v1_model_runner() -> None:
     """Keep the engine on vLLM's V1 model runner.
 
@@ -977,8 +1172,8 @@ def _neutralize_model_owned_sampling(params) -> list[str]:
     return ignored
 
 
-def _install_block_output_input_processor_patch() -> None:
-    """Reject unsupported resumable requests and own block-output defaults.
+def _install_tt_input_processor_patch() -> None:
+    """Own per-request defaults for block-output and request-limited models.
 
     vLLM 0.25.1 validates caller-owned SamplingParams before cloning them, then
     resolves max_tokens=None on the clone. Patch that narrow boundary so TT can
@@ -987,6 +1182,11 @@ def _install_block_output_input_processor_patch() -> None:
     on the clone, without mutating the shared caller-owned input. The separate
     AsyncLLM entry-point guard rejects streaming-input sessions before their
     synthetic final request can be created; this remains a chunk-level backstop.
+
+    For a model with a ``tt_request_context_limit`` the same boundary resolves
+    ``max_tokens=None`` to the room left under that limit, not under
+    ``max_model_len``: ``validate_request`` cannot, because it sees the shared
+    caller-owned params before the clone exists.
 
     TODO: remove once vLLM exposes a platform hook for per-request defaults.
     """
@@ -1014,6 +1214,17 @@ def _install_block_output_input_processor_patch() -> None:
         request = original(self, request_id, prompt, params, *args, **kwargs)
 
         cloned_params = request.sampling_params
+        request_context_limit = get_tt_request_context_limit(self.vllm_config)
+        if (
+            request_context_limit
+            and cloned_params is not None
+            and unresolved_max_tokens
+        ):
+            # validate_request already refused prompts that leave no room.
+            prompt_len = length_from_prompt_token_ids_or_embeds(
+                request.prompt_token_ids, request.prompt_embeds
+            )
+            cloned_params.max_tokens = request_context_limit - prompt_len
         if not is_block_output_model or cloned_params is None:
             return request
 
@@ -1474,6 +1685,23 @@ def register_tt_models(register_test_models=False) -> None:
         "models.tt_transformers.tt.generator_vllm:GptOssForCausalLM",
     )
 
+    # GLM-5.3-Flash (``glm5_next``) — text-only TT bridge.
+    #
+    # The checkpoint declares ``Glm5NextForConditionalGeneration`` with a
+    # nested text/vision config. vLLM 0.26.0 has no such architecture, so
+    # ``ModelConfig`` would resolve it to the Transformers multimodal fallback
+    # before ``check_and_update_config`` adds the ``TT`` prefix (the Gemma4
+    # case above). Register the bare name as well as the ``TT`` alias; the TT
+    # class is not ``SupportsMultiModal``, so requests stay text-only.
+    _glm5_next_target = (
+        "models.autoports.zai_org_glm_5_3_flash.tt.generator_vllm:Glm5NextForCausalLM"
+    )
+    for arch in (
+        "Glm5NextForConditionalGeneration",
+        "TTGlm5NextForConditionalGeneration",
+    ):
+        _register_model_if_missing(ModelRegistry, arch, _glm5_next_target)
+
     # Optionally register test models if explicitly enabled
     if register_test_models:
         register_tt_test_models()
@@ -1580,12 +1808,17 @@ class TTPlatform(Platform):
         super().pre_register_and_update(parser)
         _pin_v1_model_runner()
         _install_api_lifespan_gc_patch()
+        _install_tt_engine_death_exit_patch()
+        _install_tt_drain_patches()
         _install_torch_accelerator_cleanup_patch()
         _install_tt_harmony_truncation_patch()
         # Before ``EngineArgs.create_engine_config`` builds the VllmConfig,
         # which is where upstream decides asynchronous scheduling against the
         # speculative method name. This hook is that call's first statement.
         _install_tt_async_spec_method_patch()
+        # Before the same call builds the SpeculativeConfig, where upstream
+        # would build an ``mtp`` draft model.
+        _install_tt_mtp_speculative_config_patch()
         register_tt_models(
             register_test_models=_should_pre_register_tt_test_models_from_cli()
         )
@@ -1662,13 +1895,17 @@ class TTPlatform(Platform):
         # ``VllmConfig.__post_init__`` performs immediately after this hook.
         _pin_v1_model_runner()
         _install_api_lifespan_gc_patch()
+        _install_tt_engine_death_exit_patch()
+        _install_tt_drain_patches()
         _install_torch_accelerator_cleanup_patch()
         _install_tt_harmony_truncation_patch()
         # Too late to change this config's asynchronous setting, which upstream
         # resolved before calling this hook. Installed anyway, for a process
         # that reaches configuration without the CLI path: a second engine, or
-        # a direct VllmConfig construction, then finds the gate patched.
+        # a direct VllmConfig construction, then finds the gate patched. The
+        # SpeculativeConfig patch likewise.
         _install_tt_async_spec_method_patch()
+        _install_tt_mtp_speculative_config_patch()
         _warn_unpatched_async_spec_gate(vllm_config)
         # The class carries process-level admission state, so a live
         # block-output engine cannot share the process with a second engine:
@@ -1953,6 +2190,25 @@ class TTPlatform(Platform):
                 f"{output_tokens_per_step}"
             )
         store_tt_block_kv_extent_tokens(vllm_config, block_kv_extent)
+        # Per-request context limit under max_model_len (0 = none). The model
+        # keeps advertising max_model_len but computes longer requests
+        # unfaithfully for now, so admission must refuse them.
+        request_context_limit = resolve_tt_request_context_limit(
+            (model_capabilities or {}).get("tt_request_context_limit", 0),
+            vllm_config.model_config.max_model_len,
+            output_tokens_per_step,
+        )
+        store_tt_request_context_limit(vllm_config, request_context_limit)
+        if request_context_limit:
+            logger.warning(
+                "%s limits each request to %d tokens (prompt + output) while "
+                "max_model_len stays %d; longer requests are rejected at "
+                "admission.",
+                model_class.__name__,
+                request_context_limit,
+                vllm_config.model_config.max_model_len,
+            )
+            _install_tt_input_processor_patch()
         is_block_output_model = is_tt_block_output_model(vllm_config)
         supports_device_grammar = (
             model_capabilities.get("supports_device_grammar", False)
@@ -2033,6 +2289,12 @@ class TTPlatform(Platform):
             "Automatic prefix caching is %s",
             "enabled" if vllm_config.cache_config.enable_prefix_caching else "disabled",
         )
+
+        # --kv-transfer-config (LMCache / example connectors): admission of the
+        # execution modes the TT connector host covers.
+        from vllm_tt_plugin.kv_connector import validate_tt_kv_transfer_config
+
+        validate_tt_kv_transfer_config(vllm_config, model_class=model_class)
 
         if is_block_output_model:
             required_lifecycle_hooks = (
@@ -2215,7 +2477,7 @@ class TTPlatform(Platform):
                 model_config.generation_config = "vllm"
 
         if is_block_output_model:
-            _install_block_output_input_processor_patch()
+            _install_tt_input_processor_patch()
             _install_block_output_streaming_input_patch()
             _install_block_output_reset_abort_patch()
             _install_block_output_pause_guard_patch()
@@ -2306,8 +2568,9 @@ class TTPlatform(Platform):
                     "--no-async-scheduling, or drop the speculative flags"
                 )
             # The TT bootstrap patch admits custom_class through upstream's
-            # method check. These capability checks determine whether the
-            # selected model can serve the combined async speculative path.
+            # method check, which admits mtp on its own. These capability
+            # checks determine whether the selected model can serve the
+            # combined async speculative path.
 
         if vllm_config.speculative_config and uses_tt_lane_coordinator(vllm_config):
             raise ValueError(
@@ -2472,10 +2735,66 @@ class TTPlatform(Platform):
             )
         return max_tokens
 
+    @classmethod
+    def _get_request_context_limit(cls) -> int:
+        vllm_config = cls._resolve_tt_admission_handle()
+        return 0 if vllm_config is None else get_tt_request_context_limit(vllm_config)
+
+    @classmethod
+    def _reject_parallel_samples_over_batch(cls, params) -> None:
+        """Refuse ``n`` parallel samples beyond ``max_num_seqs``.
+
+        The ``n`` samples of one request are ``n`` sequences of the decode
+        batch; more than the batch holds serialize behind every other user
+        (``n=999``: 999 sequences, past any client timeout). A request that
+        cannot run as one batch is a client error (400), as an over-long
+        prompt is.
+        """
+        vllm_config = cls._resolve_tt_admission_handle()
+        if vllm_config is None:
+            return
+        sched = getattr(vllm_config, "scheduler_config", None)
+        cap = int(getattr(sched, "max_num_seqs", 0) or 0)
+        n = int(getattr(params, "n", 1) or 1)
+        if cap and n > cap:
+            raise ValueError(
+                f"n={n} parallel samples exceed max_num_seqs={cap} on "
+                f"{cls.device_name}: request at most {cap}"
+            )
+
+    @classmethod
+    def _reject_request_over_context_limit(cls, processed_inputs, params) -> None:
+        """Refuse a request the model's ``tt_request_context_limit`` cannot hold.
+
+        ``max_tokens=None`` is resolved against the limit later, on the clone
+        (``_install_tt_input_processor_patch``), so only the prompt needs room
+        for one output token here.
+        """
+        limit = cls._get_request_context_limit()
+        if not limit:
+            return
+        prompt_len = length_from_prompt_token_ids_or_embeds(
+            processed_inputs.get("prompt_token_ids"),
+            processed_inputs.get("prompt_embeds"),
+        )
+        requested = 1 if params.max_tokens is None else params.max_tokens
+        check_tt_request_context_limit(prompt_len, requested, limit)
+
     def get_max_output_tokens(self, prompt_len: int) -> int:
-        """Clamp the platform default to complete physical output canvases."""
+        """Clamp the platform default to complete physical output canvases, or
+        to the model's per-request context limit.
+
+        The OpenAI frontend takes the minimum of this, the request's
+        ``max_tokens`` and the room under ``max_model_len``, so an explicit
+        ``max_tokens`` past the limit is clamped exactly as one past
+        ``max_model_len`` is; a prompt with no room left is refused here.
+        """
         block_contract = type(self)._get_block_output_contract()
         if block_contract is None:
+            limit = type(self)._get_request_context_limit()
+            if limit:
+                check_tt_request_context_limit(prompt_len, 1, limit)
+                return limit - prompt_len
             return super().get_max_output_tokens(prompt_len)
         output_size, max_model_len = block_contract
         return self._resolve_block_output_max_tokens(
@@ -2498,24 +2817,37 @@ class TTPlatform(Platform):
         them made a speculating launch unusable for any sampled client and, in
         our case, failed every prompt of two standard evals with HTTP 400.
 
+        Logprobs are served the same way when the model declares
+        ``supports_narrow_decode`` (a draftless step is its ordinary decode):
+        the ordinary decode's host sampler computes them from the step's
+        logits, the values a plain launch returns, so a request asking for them
+        is decoded without speculation. A model that implements only the verify
+        shape has no such step, so there they are still refused.
+
         What remains here is what no path on this launch serves: controls that
-        need logits or a token filter the model-owned sampler does not apply.
-        A request asking for those would be answered without them, silently --
-        a grammar or token filter unapplied, requested logprobs arriving empty.
+        need a token filter the model-owned sampler does not apply. A request
+        asking for those would be answered without them, silently -- a grammar
+        or token filter unapplied.
 
         Refused per request rather than at config time because these are
         per-request controls, and a launch may legitimately mix requests that
         speculate with requests that cannot.
         """
         vllm_config = cls._resolve_tt_admission_handle()
-        if vllm_config is None or get_tt_spec_plan(vllm_config) is None:
+        plan = None if vllm_config is None else get_tt_spec_plan(vllm_config)
+        if plan is None:
             return
 
         unsupported = []
-        # temperature / min_p / the penalties are intentionally absent: those
-        # requests are decoded without speculation instead of being refused.
-        if params.logprobs is not None:
-            unsupported.append(f"logprobs={params.logprobs!r}")
+        if params.logprobs is not None and not getattr(plan, "supports_narrow_decode", False):
+            unsupported.append(
+                f"logprobs={params.logprobs!r} (the model declares no "
+                "supports_narrow_decode: every step is a verify, which "
+                "returns no logits)"
+            )
+        # temperature / min_p / the penalties / logprobs are intentionally
+        # absent: those requests are decoded without speculation instead of
+        # being refused (TTModelRunner._request_is_speculable).
         if getattr(params, "structured_outputs", None) is not None:
             unsupported.append("structured_outputs")
         if params.logit_bias:
@@ -2533,9 +2865,9 @@ class TTPlatform(Platform):
                 f"request's {unsupported}. No path on this launch applies "
                 "those, so answering without them would change what was asked "
                 "for without saying so. Sampled requests (temperature, "
-                "min_p, the penalties) ARE served here -- they simply decode "
-                "without speculation. Drop the controls above, or drop the "
-                "speculative flags from the server"
+                "min_p, the penalties) and logprobs ARE served here -- they "
+                "simply decode without speculation. Drop the controls above, "
+                "or drop the speculative flags from the server"
             )
 
     @classmethod
@@ -2557,6 +2889,8 @@ class TTPlatform(Platform):
 
         if isinstance(params, SamplingParams):
             cls._reject_unsupported_speculative_request(params)
+            cls._reject_request_over_context_limit(processed_inputs, params)
+            cls._reject_parallel_samples_over_batch(params)
 
         block_contract = cls._get_block_output_contract()
         if not isinstance(params, SamplingParams) or block_contract is None:
@@ -2576,7 +2910,7 @@ class TTPlatform(Platform):
 
         # Reject unsupported response-contract controls. Model-owned sampling
         # controls (temperature etc.) are instead accepted and neutralized on
-        # the per-request clone in _install_block_output_input_processor_patch.
+        # the per-request clone in _install_tt_input_processor_patch.
         unsupported = []
         if params.n != 1:
             unsupported.append(f"n={params.n!r} (accepted: 1)")

@@ -6,6 +6,7 @@ from __future__ import annotations
 import threading
 import time
 from collections import Counter
+from collections.abc import Callable
 from dataclasses import dataclass, fields, replace
 from typing import TYPE_CHECKING, Any, cast
 
@@ -200,6 +201,17 @@ class DeferredDecodeOutput(AsyncModelRunnerOutput):
         self._cached_output = None
         self._cached_exception = None
         self._finalize_lock = threading.Lock()
+        self._post_output_hook: Callable[[Any], Any] | None = None
+
+    def set_post_output_hook(self, hook: Callable[[Any], Any]) -> None:
+        """Transform the resolved output once, inside the exactly-once read.
+
+        The KV connector host uses this to save the step's pages and attach
+        its ``KVConnectorOutput`` after the device read-back has completed.
+        """
+        if self._finalized:
+            raise RuntimeError("post-output hook set after the step resolved")
+        self._post_output_hook = hook
 
     def ensure_finalized(self) -> Any:
         if self._finalized:
@@ -210,7 +222,10 @@ class DeferredDecodeOutput(AsyncModelRunnerOutput):
                 # failure as terminal so a racing drain cannot perform the same
                 # non-idempotent device readback a second time.
                 try:
-                    self._cached_output = self._get_output_impl()
+                    output = self._get_output_impl()
+                    if self._post_output_hook is not None:
+                        output = self._post_output_hook(output)
+                    self._cached_output = output
                 except BaseException as exc:
                     self._cached_exception = exc
                     raise

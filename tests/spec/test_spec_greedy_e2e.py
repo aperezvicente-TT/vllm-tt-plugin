@@ -37,6 +37,7 @@ from vllm_tt_plugin.async_decode import (
 )
 from vllm_tt_plugin.input_batch import InputBatch
 from vllm_tt_plugin.model_runner import TTModelRunner, _SyncForward
+from vllm_tt_plugin.spec_admission import MTP_DRAFT_METHOD
 from vllm_tt_plugin.spec_decode import (
     ACCEPT_MODE_ARGMAX_IDS,
     ACCEPT_MODE_LOGITS,
@@ -160,7 +161,9 @@ def _runner(
     return runner
 
 
-def _add_request(runner: SimpleNamespace, req_id: str, first_token: int = 1) -> None:
+def _add_request(
+    runner: SimpleNamespace, req_id: str, first_token: int = 1, logprobs: int | None = None
+) -> None:
     """Add a decoding request. ``first_token`` shifts its whole prompt.
 
     Two requests in one step need different token histories, or a defect that
@@ -170,7 +173,7 @@ def _add_request(runner: SimpleNamespace, req_id: str, first_token: int = 1) -> 
         req_id=req_id,
         prompt_token_ids=list(range(first_token, first_token + PROMPT_LEN)),
         mm_features=None,
-        sampling_params=SamplingParams(temperature=0.0),
+        sampling_params=SamplingParams(temperature=0.0, logprobs=logprobs),
         generator=None,
         block_ids=([0],),
         # Fully prefilled, so the next step is a decode rather than prompt work.
@@ -671,12 +674,14 @@ def test_a_tuple_of_host_tensors_does_not_pass_as_a_verify():
 # region The model's own drafter
 
 
-def _model_drafter_runner(model, num_speculative_tokens: int = DRAFT_LEN):
+def _model_drafter_runner(
+    model, num_speculative_tokens: int = DRAFT_LEN, method: str = "custom_class"
+):
     """A runner whose drafts come from the model, not from a host proposer."""
     return _runner(
         model,
         num_speculative_tokens=num_speculative_tokens,
-        method="custom_class",
+        method=method,
         drafts_from_model=True,
     )
 
@@ -701,6 +706,83 @@ def test_the_model_is_asked_for_the_next_drafts():
     assert call["rows"] == MAX_NUM_REQS
     assert call["committed_tokens"].shape == (MAX_NUM_REQS, DRAFT_LEN + 1)
     assert call["committed_positions"].shape == (MAX_NUM_REQS, DRAFT_LEN + 1)
+
+
+def test_a_logprobs_request_is_an_idle_row_for_the_drafter_and_drafts_nothing():
+    """Its logprobs come from the ordinary decode, so it is not speculated.
+
+    The drafter is told so up front (positions -1, the padding rows' value): a
+    model-owned drafter that speculates for a lone user would otherwise enter
+    its speculative state for drafts the runner then discards, on every step.
+    """
+    model = FakeSpecModel()
+    runner = _model_drafter_runner(model)
+    runner._spec_supports_narrow_decode = True
+    _add_request(runner, "r", logprobs=3)
+
+    _step(runner, "r")
+
+    row = runner.input_batch.req_id_to_index["r"]
+    assert bool((model.propose_calls[0]["committed_positions"][row] == -1).all())
+    drafts = runner.take_draft_token_ids()
+    assert drafts is None or not any(drafts.draft_token_ids)
+
+
+def test_a_logprobs_request_gets_the_plain_launch_s_logprobs():
+    """Bitwise the logprobs a launch without speculation returns."""
+    outs = []
+    for runner in (_model_drafter_runner(FakeSpecModel()), _runner(FakeSpecModel(), method=None)):
+        runner._spec_supports_narrow_decode = True
+        _add_request(runner, "r", logprobs=3)
+        steps = [_step(runner, "r") for _ in range(3)]
+        outs.append([(o.sampled_token_ids, o.logprobs) for o in steps])
+    (spec, plain) = outs
+    for (s_ids, s_lp), (p_ids, p_lp) in zip(spec, plain):
+        assert s_ids == p_ids
+        assert s_lp is not None and p_lp is not None
+        import numpy as np
+
+        assert np.array_equal(np.asarray(s_lp.logprob_token_ids), np.asarray(p_lp.logprob_token_ids))
+        assert np.array_equal(np.asarray(s_lp.logprobs), np.asarray(p_lp.logprobs))  # bitwise
+
+
+def test_a_verify_with_a_logprobs_row_runs_as_an_ordinary_decode():
+    """Another row's drafts are rejected for the step; the logprobs row is served.
+
+    A verify returns no logits, so a logprobs request inside one would come back
+    without them. With no multi-token commit to resolve the step is an ordinary
+    decode: every row commits one token, the drafted row's drafts count as
+    rejected, and the logprobs row gets the ordinary tail's logprobs.
+    """
+    model = FakeSpecModel()
+    runner = _runner(model)
+    runner._spec_supports_narrow_decode = True
+    _add_request(runner, "a", first_token=1)
+    _add_request(runner, "b", first_token=200, logprobs=2)
+
+    output = _step(runner, "a", "b", drafts={"a": [7, 8, 9]})
+
+    assert model.verify_calls == [], "a verify ran with a logprobs row"
+    assert len(model.plain_calls) == 1
+    assert [len(t) for t in output.sampled_token_ids] == [1, 1]
+    assert output.logprobs is not None
+    assert runner._num_logprobs_demoted_verifies == 1
+
+
+def test_a_pending_commit_keeps_the_verify_and_counts_the_logprobs_row():
+    """The one case the demotion cannot take: the commit must reach the model."""
+    model = FakeSpecModel()
+    runner = _runner(model)
+    runner._spec_supports_narrow_decode = True
+    _add_request(runner, "a", first_token=1)
+    _add_request(runner, "b", first_token=200, logprobs=2)
+    runner._req_accepted_counts["a"] = 3
+    runner._num_unspeculable_verify_rows = 0  # (the real runner's __init__ sets it)
+
+    _step(runner, "a", "b")
+
+    assert len(model.verify_calls) == 1
+    assert runner._num_logprobs_verify_rows == 1
 
 
 def test_the_drafts_the_model_proposed_reach_the_engine():
@@ -1119,6 +1201,32 @@ def test_the_forward_carries_the_hidden_handle_from_the_submission(monkeypatch):
 
     assert model.verify_hidden is not None
     assert fwd.spec_hidden is model.verify_hidden
+
+
+def test_an_mtp_launch_drafts_from_the_model_s_own_head():
+    """``mtp`` is served by the same model-owned drafter as ``custom_class``.
+
+    The MTP head is part of the target model, so the step verifies and then
+    asks ``propose_draft_tokens`` for the next drafts, handing it the verify's
+    hidden handle. No host proposer is built for it.
+    ``tests/spec/test_spec_mtp.py`` shows the runner selecting this path for
+    an ``mtp`` launch.
+    """
+    model = FakeSpecModel()
+    runner = _model_drafter_runner(model, method=MTP_DRAFT_METHOD)
+    _add_request(runner, "r")
+
+    output = _step(runner, "r")
+    drafts = runner.take_draft_token_ids()
+
+    assert len(model.propose_calls) == 1
+    assert model.propose_calls[0]["hidden"] is model.verify_hidden
+    assert runner._ngram_proposer is None
+    assert drafts is not None
+    last = output.sampled_token_ids[0][-1]
+    assert drafts.draft_token_ids[0] == [
+        (last + 1 + j) % FAKE_VOCAB_SIZE for j in range(DRAFT_LEN)
+    ]
 
 
 # endregion The model's own drafter

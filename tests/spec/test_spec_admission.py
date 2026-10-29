@@ -21,6 +21,7 @@ from tests.spec.fake_spec_model import FakeSpecModel, make_fake_spec_model
 from vllm_tt_plugin.config import get_tt_spec_plan, store_tt_spec_plan
 from vllm_tt_plugin.spec_admission import (
     MODEL_OWNED_DRAFT_METHOD,
+    MODEL_OWNED_DRAFT_METHODS,
     MODEL_OWNED_DRAFT_SENTINEL,
     method_requirements,
     resolve_speculative_plan,
@@ -187,11 +188,112 @@ def test_a_method_with_no_proposer_is_refused():
 
 def test_a_device_method_is_refused_even_by_a_fully_declaring_model():
     # FakeSpecModel declares device_propose and hidden_feed, so nothing in its
-    # declarations refuses an MTP launch. Nothing calls propose_draft_tokens,
-    # so the runner must.
+    # declarations refuses an EAGLE launch. Nothing drives an EAGLE head
+    # through propose_draft_tokens, so the runner must.
     with pytest.raises(ValueError) as excinfo:
-        _admit(_config(method=MTP_METHOD))
+        _admit(_config(method="eagle"))
     assert "no proposer drives it" in str(excinfo.value)
+
+
+def test_mtp_is_admitted_as_the_model_s_own_drafter():
+    """``mtp`` is the model's own MTP head, through the model-owned contract.
+
+    ``FakeSpecModel`` declares ``device_propose``, ``hidden_feed`` and an
+    on-device handoff, which is what an MTP head needs, and leaving ``model``
+    unset is what an operator serving the target's own head does.
+    """
+    assert MTP_METHOD in MODEL_OWNED_DRAFT_METHODS
+
+    plan = _admit(_config(method=MTP_METHOD))
+
+    assert plan is not None
+    assert plan.effective_k == 7
+
+
+def test_mtp_still_requires_the_hidden_feed():
+    """Unlike ``custom_class``, ``mtp`` names an architecture that reads the
+    target hidden state, so a model drafting without one is refused it."""
+    variant = make_fake_spec_model()
+    variant.model_capabilities = {
+        **FakeSpecModel.model_capabilities,
+        "spec_requirements": [SPEC_REQUIREMENT_DEVICE_PROPOSE],
+    }
+
+    with pytest.raises(ValueError) as excinfo:
+        _admit(_config(method=MTP_METHOD), model_class=variant)
+
+    assert SPEC_REQUIREMENT_HIDDEN_FEED in str(excinfo.value)
+    # The same model may still use the method that asks only for a proposer.
+    assert (
+        _admit(
+            _config(method=MODEL_OWNED_DRAFT_METHOD, model=MODEL_OWNED_DRAFT_SENTINEL),
+            model_class=variant,
+        )
+        is not None
+    )
+
+
+def test_mtp_may_name_the_target_checkpoint():
+    """vLLM defaults ``model`` to the target's own checkpoint for ``mtp``."""
+    config = _config(method=MTP_METHOD, model="/ckpt/target")
+    config.model_config = SimpleNamespace(model="/ckpt/target")
+
+    assert _admit(config) is not None
+
+
+def test_mtp_refuses_a_separate_draft_checkpoint():
+    """TT loads no draft weights, so a separate MTP checkpoint is never read."""
+    config = _config(method=MTP_METHOD, model="/ckpt/separate-mtp-head")
+    config.model_config = SimpleNamespace(model="/ckpt/target")
+
+    with pytest.raises(ValueError) as excinfo:
+        _admit(config)
+
+    message = str(excinfo.value)
+    assert "/ckpt/separate-mtp-head" in message
+    assert "/ckpt/target" in message
+    assert "propose_draft_tokens" in message
+
+
+def test_dflash_is_admitted_as_the_model_s_own_drafter():
+    """``dflash`` is the Apache-2.0 DFlash2 drafter run by the loaded model
+    itself (Stage 17's in-trace drafter kind), through the model-owned
+    contract; 'model' names that drafter's Hub id."""
+    from vllm_tt_plugin.spec_admission import DFLASH_DRAFT_METHOD, DFLASH_DRAFTER_ID
+
+    assert DFLASH_DRAFT_METHOD in MODEL_OWNED_DRAFT_METHODS
+    assert method_requirements(DFLASH_DRAFT_METHOD) == (
+        SPEC_REQUIREMENT_DEVICE_PROPOSE,
+        SPEC_REQUIREMENT_HIDDEN_FEED,
+    )
+
+    plan = _admit(_config(method=DFLASH_DRAFT_METHOD, model=DFLASH_DRAFTER_ID))
+
+    assert plan is not None
+    assert plan.effective_k == 7
+    assert _admit(_config(method=DFLASH_DRAFT_METHOD)) is not None
+
+
+def test_dflash_refuses_any_other_draft_checkpoint(monkeypatch):
+    """TT loads no draft weights through vLLM: only the Apache-2.0 drafter (its
+    id, or the local directory GLM53_DF2_DIR names) may be declared."""
+    from vllm_tt_plugin.spec_admission import (
+        DFLASH_DRAFT_METHOD,
+        DFLASH_DRAFTER_DIR_ENV,
+        DFLASH_DRAFTER_ID,
+    )
+
+    monkeypatch.delenv(DFLASH_DRAFTER_DIR_ENV, raising=False)
+    with pytest.raises(ValueError) as excinfo:
+        _admit(_config(method=DFLASH_DRAFT_METHOD, model="/ckpt/not-the-drafter"))
+    message = str(excinfo.value)
+    assert DFLASH_DRAFTER_ID in message
+    assert "/ckpt/not-the-drafter" in message
+
+    monkeypatch.setenv(DFLASH_DRAFTER_DIR_ENV, "/data/drafter")
+    assert _admit(_config(method=DFLASH_DRAFT_METHOD, model="/data/drafter")) is not None
+    with pytest.raises(ValueError):
+        _admit(_config(method=DFLASH_DRAFT_METHOD, model="/data/other"))
 
 
 def test_the_model_owned_drafter_is_admitted():

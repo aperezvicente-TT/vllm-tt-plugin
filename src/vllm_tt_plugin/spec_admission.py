@@ -15,6 +15,7 @@ The model-side contract this admits against, which a tt-metal model class must
 implement, is documented in ``docs/SPEC_DECODE_CONTRACT.md``.
 """
 
+import os
 from typing import TYPE_CHECKING, get_args
 
 from vllm_tt_plugin.spec_decode import (
@@ -51,12 +52,41 @@ _RUNNABLE_ACCEPT_MODES = (ACCEPT_MODE_ARGMAX_IDS,)
 MODEL_OWNED_DRAFT_METHOD = "custom_class"
 MODEL_OWNED_DRAFT_SENTINEL = "vllm_tt_plugin.model_owned_drafter"
 
+# vLLM's name for a model drafting with its own Multi-Token Prediction head. On
+# TT that head is part of the loaded target, so the method runs through the
+# same model-owned drafter contract as ``custom_class``: the runner calls
+# ``propose_draft_tokens``, and no upstream proposer or draft checkpoint is
+# built (``platform._install_tt_mtp_speculative_config_patch`` keeps vLLM's
+# ``SpeculativeConfig`` from building a draft model config). It keeps vLLM's
+# EAGLE/MTP requirements below, because an MTP head reads the target's hidden
+# state by construction.
+MTP_DRAFT_METHOD = "mtp"
+
+# vLLM's name for the DFlash family of block drafters (a separate checkpoint
+# drafting a block of K tokens from the target's hidden-state taps). On TT the
+# loaded GLM-5.3-Flash backend owns that drafter too: the Apache-2.0 DFlash2
+# drafter runs INSIDE the model's speculative decode step (the backend is built
+# with GLM53_SPEC_KIND=dflash2, its weights read from GLM53_DF2_DIR), so the
+# runner calls ``propose_draft_tokens`` exactly as for ``mtp`` and vLLM builds
+# no draft model (``platform._install_tt_mtp_speculative_config_patch``). The
+# only drafter checkpoint admitted is the Apache-2.0 one.
+DFLASH_DRAFT_METHOD = "dflash"
+DFLASH_DRAFTER_ID = "canada-quant/GLM-5.3-Flash-DFlash2-G"
+DFLASH_DRAFTER_DIR_ENV = "GLM53_DF2_DIR"
+
+# Methods whose drafts come from the loaded model's ``propose_draft_tokens``.
+MODEL_OWNED_DRAFT_METHODS = (
+    MODEL_OWNED_DRAFT_METHOD,
+    MTP_DRAFT_METHOD,
+    DFLASH_DRAFT_METHOD,
+)
+
 # Methods the runner can actually propose drafts for. The requirements table
 # below says what a method needs *of the model*; this says what the plugin has
 # implemented. Admitting a method with no proposer would start a server that
 # takes the speculative flags, drafts nothing, and serves plain decoding while
 # reporting a speedup it never achieved.
-_PROPOSABLE_METHODS = ("ngram", MODEL_OWNED_DRAFT_METHOD)
+_PROPOSABLE_METHODS = ("ngram", *MODEL_OWNED_DRAFT_METHODS)
 
 _DEVICE_DRAFTER = (SPEC_REQUIREMENT_DEVICE_PROPOSE, SPEC_REQUIREMENT_HIDDEN_FEED)
 
@@ -100,7 +130,9 @@ def _build_method_requirements() -> dict[str, tuple[str, ...]]:
         # block alone declares nothing extra, and requiring the declaration
         # here would have forced that model to claim a feed it never uses. The
         # named upstream methods below are different: each one is a drafter
-        # architecture that reads the hidden state by construction.
+        # architecture that reads the hidden state by construction, which is
+        # why ``mtp`` keeps that requirement even though TT serves it through
+        # this same contract.
         MODEL_OWNED_DRAFT_METHOD: (SPEC_REQUIREMENT_DEVICE_PROPOSE,),
     }
     # EagleModelTypes flattens to EAGLE, every MTP variant and dFlash. All of
@@ -214,6 +246,52 @@ def resolve_speculative_plan(
                 "requires a dotted path there and nothing imports it: the "
                 f"drafter is {model_class.__name__}.propose_draft_tokens"
             )
+
+    # vLLM's mtp method reads 'model' as the checkpoint holding the MTP head and
+    # defaults it to the target's own. On TT the drafter is the loaded target's
+    # head, so 'model' may name only the target: any other checkpoint is never
+    # loaded, and naming it would read as the thing doing the drafting.
+    if method == MTP_DRAFT_METHOD:
+        declared_model = getattr(speculative_config, "model", None)
+        target_config = getattr(vllm_config, "model_config", None)
+        target_model = getattr(target_config, "model", None)
+        if declared_model is not None and declared_model != target_model:
+            raise ValueError(
+                f"speculative method {method!r} means the MTP head of "
+                f"{model_class.__name__} itself, drafting on device through "
+                "propose_draft_tokens, so its 'model' key must be unset or "
+                f"name the target checkpoint {target_model!r}, not "
+                f"{declared_model!r}. The TT backend loads no separate draft "
+                "checkpoint"
+            )
+
+    # vLLM's dflash method reads 'model' as the drafter checkpoint and builds a
+    # draft model from it. On TT the loaded target runs the drafter itself and
+    # reads its weights from GLM53_DF2_DIR, so 'model' may only name the
+    # Apache-2.0 drafter (its Hub id, or the local directory the backend reads):
+    # any other checkpoint is never loaded and would read as the drafter.
+    if method == DFLASH_DRAFT_METHOD:
+        declared_model = getattr(speculative_config, "model", None)
+        local_dir = os.environ.get(DFLASH_DRAFTER_DIR_ENV)
+        is_dir = isinstance(declared_model, str) and os.path.isdir(declared_model)
+        if not (
+            declared_model in (None, DFLASH_DRAFTER_ID)
+            or (local_dir is not None and declared_model == local_dir)
+            or (local_dir is None and is_dir)
+        ):
+            raise ValueError(
+                f"speculative method {method!r} means the Apache-2.0 DFlash2 "
+                f"drafter {DFLASH_DRAFTER_ID!r} run by {model_class.__name__} "
+                "itself (propose_draft_tokens), so its 'model' key must be "
+                f"unset, that id, or the local drafter directory "
+                f"{DFLASH_DRAFTER_DIR_ENV} names ({local_dir!r}), not "
+                f"{declared_model!r}. The TT backend loads no separate draft "
+                "checkpoint through vLLM"
+            )
+        if local_dir is None and is_dir:
+            # the backend reads the drafter from this directory (the engine
+            # core inherits the environment of this process)
+            os.environ[DFLASH_DRAFTER_DIR_ENV] = declared_model
 
     # Refused on the requirement, not only on the returned plan, so a model
     # whose two declarations contradict each other is reported rather than
