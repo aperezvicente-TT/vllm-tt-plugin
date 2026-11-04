@@ -333,3 +333,44 @@ def test_runner_waits_only_for_the_step_that_completes_a_prompt(monkeypatch):
     ]
     assert op.waits == [3]  # once, after the last chunk's save
     assert not kv_transfer._unwaited_saves
+
+
+def test_copy_op_supplies_connector_caches(monkeypatch):
+    registered = []
+
+    class Conn:
+        def register_kv_caches(self, caches):
+            registered.append(caches)
+
+        def set_host_xfer_buffer_ops(self, op):
+            pass
+
+    class OwnShadows:
+        def shadow_kv_caches(self):
+            return {"l0": "provider shadow"}
+
+    import vllm.distributed.kv_transfer as kvt
+
+    monkeypatch.setattr(kvt, "has_kv_transfer_group", lambda: True)
+    monkeypatch.setattr(kvt, "get_kv_transfer_group", lambda: Conn())
+    monkeypatch.setattr(kv_transfer, "_copy_op", None)
+    spec = SimpleNamespace(
+        num_kv_heads=1, block_size=4, head_size=8, dtype=torch.bfloat16
+    )
+    cfg = SimpleNamespace(
+        num_blocks=2,
+        kv_cache_groups=[SimpleNamespace(kv_cache_spec=spec, layer_names=["l0"])],
+    )
+    monkeypatch.setattr(
+        kv_transfer, "_copy_op_provider", lambda m, c, cfg: OwnShadows()
+    )
+    kv_transfer.register_device_caches(None, {}, cfg)
+    monkeypatch.setattr(kv_transfer, "_copy_op_provider", lambda m, c, cfg: object())
+    kv_transfer.register_device_caches(None, {}, cfg)
+    assert registered[0] == {"l0": "provider shadow"}
+    assert registered[1]["l0"].shape == (
+        2,
+        1,
+        4,
+        16,
+    )  # the plugin's own, without the method

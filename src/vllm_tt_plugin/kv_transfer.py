@@ -12,7 +12,9 @@ connectors see the TT cache through three things defined here:
 - A copy-op provider: host-buffer connectors move blocks between the device cache and
   their host buffers through a `CopyBlocksOp`. The provider (registered by the tt-kv
   package) builds it from the model's device caches, so this plugin has no
-  device-transfer code of its own.
+  device-transfer code of its own. A copy op with a `shadow_kv_caches()` method supplies
+  the per-layer tensors connectors see instead of the ones below: LMCache moves blocks
+  by the tensors' device and token/head axes, which only the provider knows.
 """
 
 from __future__ import annotations
@@ -179,7 +181,10 @@ def register_device_caches(
     # kv_transfer_compat_factors).
     global _copy_op
     _copy_op = _copy_op_provider(mesh_device, device_caches, kv_cache_config)
-    connector.register_kv_caches(shadow_kv_caches(kv_cache_config))
+    own = getattr(_copy_op, "shadow_kv_caches", None)
+    connector.register_kv_caches(
+        own() if own is not None else shadow_kv_caches(kv_cache_config)
+    )
     connector.set_host_xfer_buffer_ops(_copy_op)
 
 
