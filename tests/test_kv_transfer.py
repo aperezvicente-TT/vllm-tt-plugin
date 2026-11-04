@@ -197,3 +197,139 @@ def test_block_float_spec_and_shadow_bytes():
     sh = kv_transfer.shadow_kv_caches(cfg)["l0"]
     assert sh.dtype == torch.uint8 and sh.shape == (10, 8, 64, 272)
     assert sh.numel() == 10 * spec.page_size_bytes
+
+
+# Streamed saves: a chunk's save overlaps the next chunk; only the step that completes a
+# prompt waits.
+
+
+def sched(new=(), cached=(), finished=(), preempted=None):
+    """Scheduler output: `new` / `cached` are (req_id, computed_before, scheduled)
+    tuples."""
+    return SimpleNamespace(
+        scheduled_new_reqs=[
+            SimpleNamespace(req_id=r, num_computed_tokens=c) for r, c, _ in new
+        ],
+        scheduled_cached_reqs=SimpleNamespace(
+            req_ids=[r for r, _, _ in cached],
+            num_computed_tokens=[c for _, c, _ in cached],
+        ),
+        num_scheduled_tokens={r: n for r, _, n in (*new, *cached)},
+        finished_req_ids=set(finished),
+        preempted_req_ids=preempted,
+    )
+
+
+PROMPTS = {"a": 3000, "b": 1000}
+
+
+def test_partial_prefill_steps_leave_saves_running():
+    lens = PROMPTS.get
+    assert not kv_transfer.output_needs_saves(sched(new=[("a", 0, 1024)]), lens)
+    assert not kv_transfer.output_needs_saves(sched(cached=[("a", 1024, 1024)]), lens)
+    assert kv_transfer.output_needs_saves(
+        sched(cached=[("a", 2048, 952)]), lens
+    )  # last chunk
+    # any request that can finish makes the step wait (saves complete in order)
+    assert kv_transfer.output_needs_saves(
+        sched(new=[("b", 0, 1000)], cached=[("a", 1024, 1024)]), lens
+    )
+    assert kv_transfer.output_needs_saves(
+        sched(new=[("x", 0, 10)]), lens
+    )  # unknown length
+    assert kv_transfer.output_needs_saves(sched(), lens)
+    # a request resumed after preemption: only reaching the end of the prompt can sample
+    assert not kv_transfer.output_needs_saves(sched(cached=[("b", 0, 512)]), lens)
+
+
+class FakeSaveOp:
+    """Asynchronous saves: tickets in order, completed only when waited."""
+
+    def __init__(self):
+        self.issued, self.waits = 0, []
+
+    def save(self):
+        self.issued += 1
+
+    def wait_saves(self):
+        self.waits.append(self.issued)
+
+
+def test_saves_of_freed_requests_are_waited(monkeypatch):
+    op = FakeSaveOp()
+    monkeypatch.setattr(kv_transfer, "_copy_op", op)
+    monkeypatch.setattr(kv_transfer, "_unwaited_saves", set())
+    kv_transfer.defer_saves(sched(new=[("a", 0, 1024)]))
+    kv_transfer.wait_saves_of_freed(sched(finished={"b"}))
+    assert op.waits == []  # nothing of "a" freed
+    kv_transfer.wait_saves_of_freed(sched(finished={"a"}))  # aborted mid-prefill
+    assert op.waits == [0] and not kv_transfer._unwaited_saves
+    kv_transfer.defer_saves(sched(new=[("a", 0, 1024)]))
+    kv_transfer.wait_saves_of_freed(sched(preempted={"a"}))
+    assert op.waits == [0, 0]
+
+
+def test_runner_waits_only_for_the_step_that_completes_a_prompt(monkeypatch):
+    """Three chunks of one prompt through the runner's connector lifecycle: each step
+    issues its chunk's save after the forward; only the last step's output waits, and
+    the next chunk's forward is enqueued while earlier saves run."""
+    from collections import deque
+    from contextlib import contextmanager, nullcontext
+
+    import vllm.forward_context
+    from vllm.v1.worker.kv_connector_model_runner_mixin import (
+        KVConnectorModelRunnerMixin,
+    )
+
+    from vllm_tt_plugin.model_runner import TTModelRunner
+
+    op = FakeSaveOp()
+    monkeypatch.setattr(kv_transfer, "_copy_op", op)
+    monkeypatch.setattr(kv_transfer, "_unwaited_saves", set())
+    monkeypatch.setattr(kv_transfer, "_held_recvs", [])
+    events = []
+
+    @contextmanager
+    def lifecycle(scheduler_output):
+        yield SimpleNamespace(finished_recving=None)
+        # wait_for_save: the connector issues this step's save after the forward.
+        op.save()
+        events.append(("save", op.issued))
+
+    def body(self, scheduler_output):
+        events.append(("forward", op.issued))
+        self._pending_samples.append(
+            lambda grammar: SimpleNamespace(get_output=lambda: None)
+        )
+        return None
+
+    monkeypatch.setattr(
+        KVConnectorModelRunnerMixin, "_get_kv_connector_output", staticmethod(lifecycle)
+    )
+    monkeypatch.setattr(
+        vllm.forward_context, "set_forward_context", lambda *a, **k: nullcontext()
+    )
+    monkeypatch.setattr(TTModelRunner, "_execute_model_body", body)
+    runner = SimpleNamespace(
+        vllm_config=None,
+        _pending_samples=deque(),
+        requests={"a": SimpleNamespace(num_prompt_tokens=3000)},
+    )
+    for computed, n in ((0, 1024), (1024, 1024), (2048, 952)):
+        out = (
+            sched(new=[("a", 0, n)])
+            if computed == 0
+            else sched(cached=[("a", computed, n)])
+        )
+        assert TTModelRunner._execute_model_with_kv_connector(runner, out) is None
+        runner._pending_samples.popleft()(None)
+    assert events == [
+        ("forward", 0),
+        ("save", 1),
+        ("forward", 1),
+        ("save", 2),
+        ("forward", 2),
+        ("save", 3),
+    ]
+    assert op.waits == [3]  # once, after the last chunk's save
+    assert not kv_transfer._unwaited_saves

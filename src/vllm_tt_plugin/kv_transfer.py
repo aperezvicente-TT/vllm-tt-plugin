@@ -53,6 +53,8 @@ _copy_op: Any = None
 # Received requests whose host -> device copy is still running: (request ids, load
 # ticket).
 _held_recvs: list[tuple[set[str], int]] = []
+# Requests scheduled in steps whose saves were left running (see output_needs_saves).
+_unwaited_saves: set[str] = set()
 
 
 def register_copy_op_provider(provider: CopyOpProvider) -> None:
@@ -202,10 +204,65 @@ def num_command_queues(vllm_config: VllmConfig) -> int:
 
 
 def wait_saves() -> None:
-    """Saves must land before the step's output is returned: returning it can finish a
-    request on the prefill node, and the decode node then reads the host buffer."""
+    """Saves must land before an output that can finish a request is returned: the
+    decode node then reads the host buffer. Saves complete in order, so this covers
+    every earlier save."""
     if _copy_op is not None and hasattr(_copy_op, "wait_saves"):
         _copy_op.wait_saves()
+    _unwaited_saves.clear()
+
+
+def _scheduled_progress(scheduler_output):
+    """(request id, tokens computed before the step, tokens scheduled in it) per
+    scheduled request."""
+    n = scheduler_output.num_scheduled_tokens
+    for r in scheduler_output.scheduled_new_reqs:
+        yield r.req_id, r.num_computed_tokens, n.get(r.req_id, 0)
+    cached = scheduler_output.scheduled_cached_reqs
+    for req_id, computed in zip(cached.req_ids, cached.num_computed_tokens):
+        yield req_id, computed, n.get(req_id, 0)
+
+
+def output_needs_saves(
+    scheduler_output, num_prompt_tokens: Callable[[str], int | None]
+) -> bool:
+    """Whether the step's saves must complete before its output is returned.
+
+    A step whose requests are all partial prefills (each stops short of its prompt)
+    samples nothing and finishes no request, so its saves (the blocks of the chunk just
+    computed) keep running while the next chunk is computed. The step that completes a
+    prompt waits, and with it every earlier save. A request of unknown prompt length
+    counts as complete.
+    """
+    progress = list(_scheduled_progress(scheduler_output))
+    if not progress:
+        return True
+    for req_id, computed, scheduled in progress:
+        total = num_prompt_tokens(req_id)
+        if total is None or computed + scheduled >= total:
+            return True
+    return False
+
+
+def defer_saves(scheduler_output) -> None:
+    """Record the requests of a step whose saves were left running."""
+    _unwaited_saves.update(r for r, _, _ in _scheduled_progress(scheduler_output))
+
+
+def wait_saves_of_freed(scheduler_output) -> None:
+    """Before a step's loads and forward, wait for running saves of requests whose
+    blocks were freed since the last step (finished early, aborted or preempted).
+
+    Their blocks may be reused in this step: a received request's host slots would
+    otherwise be written by both the old save and the new receive. A later save to the
+    same slot needs no wait, because saves complete in order.
+    """
+    if not _unwaited_saves:
+        return
+    freed = set(scheduler_output.finished_req_ids or ())
+    freed |= set(getattr(scheduler_output, "preempted_req_ids", None) or ())
+    if _unwaited_saves & freed:
+        wait_saves()
 
 
 def gate_received(kv_output) -> None:

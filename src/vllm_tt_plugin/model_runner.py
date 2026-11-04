@@ -3167,7 +3167,9 @@ class TTModelRunner:
         Loads start and finished transfers are collected every step, including steps
         with no tokens: that is when a decode node waits for its remote KV. Saves
         (device -> host) run after the forward is enqueued, so they are ordered after it
-        on the device queue.
+        on the device queue. A step of partial prefills only leaves its saves running
+        into the next chunk; the step that completes a prompt waits for them
+        (kv_transfer.output_needs_saves).
         """
         from vllm.forward_context import set_forward_context
         from vllm.v1.worker.kv_connector_model_runner_mixin import (
@@ -3178,6 +3180,7 @@ class TTModelRunner:
             raise NotImplementedError(
                 "KV connectors are not supported with TT lane data parallelism"
             )
+        kv_transfer.wait_saves_of_freed(scheduler_output)
         with (
             set_forward_context(None, self.vllm_config),
             KVConnectorModelRunnerMixin._get_kv_connector_output(
@@ -3193,10 +3196,19 @@ class TTModelRunner:
         if ret is EMPTY_MODEL_RUNNER_OUTPUT:
             kv_transfer.wait_saves()
             return ModelRunnerOutput.with_kv_conn_output_only(kv_output)
+        requests = getattr(self, "requests", {})
+
+        def num_prompt_tokens(req_id):
+            state = requests.get(req_id)
+            return None if state is None else state.num_prompt_tokens
+
+        wait = kv_transfer.output_needs_saves(scheduler_output, num_prompt_tokens)
+        if not wait:
+            kv_transfer.defer_saves(scheduler_output)
         if ret is None and self._pending_samples:
             finish = self._pending_samples.pop()
             self._pending_samples.append(
-                partial(_finish_with_kv_output, finish, kv_output)
+                partial(_finish_with_kv_output, finish, kv_output, wait_saves=wait)
             )
         return ret
 
@@ -4984,14 +4996,16 @@ class TTModelRunner:
             self.model.warmup_model_decode(enable_trace=True, **decode_kwargs)
 
 
-def _finish_with_kv_output(finish, kv_output, grammar_output):
+def _finish_with_kv_output(finish, kv_output, grammar_output, wait_saves=True):
     """Attach a step's KV connector output to the runner output its sampler produces.
 
-    The step's KV saves were enqueued after its forward; they overlap sampling and are
-    awaited here, before the output can finish a request.
+    The step's KV saves were enqueued after its forward; they overlap sampling and, if
+    the output can finish a request (`wait_saves`), are awaited here before it is
+    returned.
     """
     out = finish(grammar_output)
-    kv_transfer.wait_saves()
+    if wait_saves:
+        kv_transfer.wait_saves()
     kv_transfer.release_ready(kv_output)
     if out is None:
         return out
