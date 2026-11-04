@@ -214,6 +214,24 @@ python examples/offline_inference_tt.py \
   --additional-config '{"tt": {"dispatch_core_axis": "col", "sample_on_device_mode": "all", "worker_l1_size": 1344544, "trace_region_size": 216580672}}'
 ```
 
+To serve Llama 3.1 8B Instruct from tt-metal's TTTv2 model path
+(`models/common/models/llama3_8b`, whose prefill is traced with runtime cached
+and chunk starts) on one Blackhole P150:
+
+```bash
+MESH_DEVICE=P150 \
+TT_LLAMA_TEXT_VER=tt_transformers_v2 \
+python examples/server_example_tt.py \
+  --model "meta-llama/Llama-3.1-8B-Instruct" \
+  --max-num-batched-tokens 1024
+```
+
+`tt_transformers_v2` registers the TTTv2 generator for `TTLlamaForCausalLM`, and
+startup refuses a checkpoint it has no generator for, naming the supported
+ones. On P150 TTTv2 warms and traces 128- and 1024-token prefill invocations
+only, so prompts longer than 1024 tokens need chunked prefill with
+`--max-num-batched-tokens` at most 1024.
+
 To run GPT-OSS 20B on Wormhole Galaxy:
 
 ```bash

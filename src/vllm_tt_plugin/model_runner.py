@@ -44,6 +44,7 @@ from vllm_tt_plugin.async_decode import (
 )
 from vllm_tt_plugin.config import (
     get_tt_data_parallel_size,
+    get_tt_kv_cache_dtype,
     get_tt_max_batch_size,
     get_tt_output_tokens_per_step,
     get_tt_per_lane_max_num_seqs,
@@ -826,18 +827,10 @@ class TTModelRunner:
         )
 
     def _engine_kv_cache_dtype_kwargs(self) -> dict:
-        """``--kv-cache-dtype`` as the model allocator's ``kv_cache_dtype``.
-
-        "auto" keeps the model's own precision profile. An explicit dtype must reach the
-        device cache: connectors size host buffers from it.
-        """
-        cache_dtype = self.cache_config.cache_dtype
-        if cache_dtype == "auto":
-            return {}
-        ttnn_dtypes = {"bfloat16": ttnn.bfloat16}
-        if cache_dtype not in ttnn_dtypes:
-            raise ValueError(f"--kv-cache-dtype {cache_dtype} is not supported on TT")
-        return {"kv_cache_dtype": ttnn_dtypes[cache_dtype]}
+        """``--kv-cache-dtype`` as the model allocator's ``kv_cache_dtype`` (none for
+        "auto")."""
+        dtype = get_tt_kv_cache_dtype(self.cache_config.cache_dtype)
+        return {} if dtype is None else {"kv_cache_dtype": dtype}
 
     def _block_tables_per_layer(
         self, block_tables_per_group: list[torch.Tensor]

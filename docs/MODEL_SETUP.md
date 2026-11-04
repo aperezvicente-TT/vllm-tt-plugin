@@ -50,6 +50,7 @@ adapter = model_class.initialize_vllm_model(
     max_seq_len=model_config.max_model_len,
     tt_data_parallel=tt_data_parallel,
     optimizations=optimizations,
+    kv_cache_dtype=kv_cache_dtype,  # only when declared, see below
 )
 ```
 
@@ -65,6 +66,7 @@ allocation, and lifecycle hooks. The adapter owns model and weight preparation;
 | `max_seq_len` | Resolved `model_config.max_model_len`. |
 | `tt_data_parallel` | In-process lane count; 1 for each standard multi-process DP rank. |
 | `optimizations` | `None`, `"performance"`, or `"accuracy"`, from `additional_config["tt"]`. |
+| `kv_cache_dtype` | An explicit `--kv-cache-dtype` as a ttnn dtype. Passed only when it is not `auto` and `initialize_vllm_model` declares a `kv_cache_dtype` parameter: a model that fixes its KV dtype at construction declares it. |
 
 `TTWorker.shutdown` releases runner resources before closing the mesh. See
 [Model lifecycle](MODEL_LIFECYCLE.md) for adapter cleanup hooks.
@@ -125,6 +127,9 @@ Sources: `get_num_available_blocks_tt`, `TTWorker.get_kv_cache_spec`, and
    Otherwise, `TTModelRunner._allocate_kv_caches` calls
    `allocate_kv_cache(shape, dtype, num_layers)` and requires identical per-layer
    shapes and dtypes.
+   With an explicit `--kv-cache-dtype` either allocator also receives
+   `kv_cache_dtype=<ttnn dtype>`, and the device cache must use that dtype: KV
+   connectors size their host buffers from it.
 3. `TTModelRunner` stores the allocator result as `kv_caches` and passes the
    allocator result to warmup and execution as `kv_cache`.
 

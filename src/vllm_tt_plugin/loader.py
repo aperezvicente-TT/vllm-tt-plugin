@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2025 Tenstorrent USA, Inc.
 
+import inspect
+
 from torch import nn
 from vllm.config import ModelConfig, VllmConfig
 from vllm.model_executor.model_loader import BaseModelLoader
@@ -9,6 +11,7 @@ from vllm.model_executor.model_loader.utils import get_model_architecture
 from vllm_tt_plugin.config import (
     get_tt_config,
     get_tt_data_parallel_size,
+    get_tt_kv_cache_dtype,
     get_tt_max_batch_size,
 )
 from vllm_tt_plugin.logger import init_tt_logger
@@ -42,6 +45,7 @@ class TTModelLoader(BaseModelLoader):
             max_seq_len=model_config.max_model_len,
             tt_data_parallel=tt_data_parallel,
             optimizations=optimizations,
+            **_construction_kv_cache_dtype(model_class, vllm_config),
         )
         return model
 
@@ -53,3 +57,17 @@ class TTModelLoader(BaseModelLoader):
         """Load weights into a model. This standalone API allows
         inplace weights loading for an already-initialized model"""
         raise NotImplementedError
+
+
+def _construction_kv_cache_dtype(model_class, vllm_config: VllmConfig) -> dict:
+    """``kv_cache_dtype`` for models that fix their KV dtype when they are built.
+
+    Such a model declares a ``kv_cache_dtype`` parameter on ``initialize_vllm_model``;
+    an explicit ``--kv-cache-dtype`` then reaches it here as well as at KV allocation.
+    Other models receive it at allocation only.
+    """
+    dtype = get_tt_kv_cache_dtype(vllm_config.cache_config.cache_dtype)
+    if dtype is None:
+        return {}
+    params = inspect.signature(model_class.initialize_vllm_model).parameters
+    return {"kv_cache_dtype": dtype} if "kv_cache_dtype" in params else {}

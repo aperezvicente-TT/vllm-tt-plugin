@@ -1369,6 +1369,55 @@ def _register_models_from_extra_dir(ModelRegistry) -> int:
     return count
 
 
+# TT_LLAMA_TEXT_VER=tt_transformers_v2: Llama text served by tt-metal's TTTv2 generators
+# (models/common/models, built on models/common/llm_runtime). A TTTv2 generator is built
+# for exact checkpoints, so the checkpoint is checked at startup
+# (`_validate_tttv2_llama_checkpoint`); this maps each supported checkpoint name (the
+# last component of --model) to its generator.
+_TTTV2_LLAMA_TEXT_VERSION = "tt_transformers_v2"
+_TTTV2_LLAMA_TEXT_TARGETS = {
+    "Llama-3.1-8B-Instruct": "models.common.models.llama3_8b.generator:Llama3Generator",
+}
+# Registration happens before the checkpoint is known, so one generator serves the
+# family.
+(_TTTV2_LLAMA_TEXT_TARGET,) = set(_TTTV2_LLAMA_TEXT_TARGETS.values())
+
+
+def _checkpoint_name(model: str) -> str:
+    """Checkpoint name of --model: the last component of a Hub id or directory. A Hub
+    cache snapshot path (`.../models--org--name/snapshots/<hash>`, what --model resolves
+    to offline) is named by its `models--org--name` component."""
+    parts = os.path.normpath(model).split(os.sep)
+    for part in reversed(parts):
+        if part.startswith("models--"):
+            return part.split("--")[-1]
+    return parts[-1]
+
+
+def _validate_tttv2_llama_checkpoint(
+    vllm_config: "VllmConfig", model_class: type
+) -> None:
+    """Refuse a checkpoint the TTTv2 Llama generator was not built for, naming the
+    supported set."""
+    target_module, target_class = _TTTV2_LLAMA_TEXT_TARGET.split(":")
+    if (
+        os.getenv("TT_LLAMA_TEXT_VER") != _TTTV2_LLAMA_TEXT_VERSION
+        or getattr(model_class, "__module__", None) != target_module
+        or getattr(model_class, "__name__", None) != target_class
+    ):
+        return
+    mc = vllm_config.model_config
+    served = getattr(mc, "served_model_name", None)
+    served = [served] if isinstance(served, str) else list(served or [])
+    names = {_checkpoint_name(str(m)) for m in [mc.model, *served]}
+    if not names & set(_TTTV2_LLAMA_TEXT_TARGETS):
+        raise ValueError(
+            f"TT_LLAMA_TEXT_VER={_TTTV2_LLAMA_TEXT_VERSION} does not support "
+            f"checkpoint {vllm_config.model_config.model!r}; supported: "
+            f"{', '.join(sorted(_TTTV2_LLAMA_TEXT_TARGETS))}"
+        )
+
+
 def _builtin_models_enabled() -> bool:
     """Whether to register the built-in (hard-coded) TT model map.
 
@@ -1442,11 +1491,13 @@ def register_tt_models(register_test_models=False) -> None:
         path_llama_text = (
             "models.demos.llama31_8b_qb2.tt.generator_vllm:LlamaForCausalLM"
         )
+    elif llama_text_version == _TTTV2_LLAMA_TEXT_VERSION:
+        path_llama_text = _TTTV2_LLAMA_TEXT_TARGET
     else:
         raise ValueError(
             f"Unsupported TT Llama version: {llama_text_version}, "
             "pick one of [tt_transformers, llama3_70b_galaxy, "
-            "llama2_70b, llama31_8b_qb2]"
+            f"llama2_70b, llama31_8b_qb2, {_TTTV2_LLAMA_TEXT_VERSION}]"
         )
 
     # Llama3.1/3.2 - Text
@@ -2055,6 +2106,7 @@ class TTPlatform(Platform):
         from vllm.model_executor.model_loader.utils import get_model_architecture
 
         model_class, _ = get_model_architecture(vllm_config.model_config)
+        _validate_tttv2_llama_checkpoint(vllm_config, model_class)
 
         # Get model capabilities from the class
         model_capabilities: dict | None = getattr(

@@ -747,3 +747,20 @@ def get_tt_decode_interleave_config(
             _DECODE_INTERLEAVE_DECODE_STEPS_DEFAULT,
         ),
     )
+
+
+def get_tt_kv_cache_dtype(cache_dtype: str) -> Any:
+    """``--kv-cache-dtype`` as a ttnn dtype; ``None`` for "auto" (the model's precision
+    profile).
+
+    An explicit dtype must reach the device cache: KV connectors size host buffers from
+    it.
+    """
+    if cache_dtype == "auto":
+        return None
+    import ttnn
+
+    ttnn_dtypes = {"bfloat16": ttnn.bfloat16}
+    if cache_dtype not in ttnn_dtypes:
+        raise ValueError(f"--kv-cache-dtype {cache_dtype} is not supported on TT")
+    return ttnn_dtypes[cache_dtype]
