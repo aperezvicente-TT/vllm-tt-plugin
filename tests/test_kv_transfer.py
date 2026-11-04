@@ -1,0 +1,139 @@
+"""Host-only tests for KV connector support (vllm_tt_plugin.kv_transfer and scheduler
+helpers)."""
+
+from types import SimpleNamespace
+
+import torch
+
+from vllm_tt_plugin import kv_transfer
+from vllm_tt_plugin.scheduler import _merge_connector_metadata
+
+
+class Meta:
+    def __init__(self, **kw):
+        self.reqs_to_recv = {}
+        self.reqs_to_save = {}
+        self.reqs_in_batch = set()
+        self.scheduler_clock = 0.0
+        self.__dict__.update(kw)
+
+
+def test_merge_keeps_first_pass_receives():
+    first = Meta(reqs_to_recv={"a": 1}, reqs_in_batch={"a"}, scheduler_clock=1.0)
+    second = Meta(reqs_to_save={"b": 2}, reqs_in_batch={"b"}, scheduler_clock=2.0)
+    out = _merge_connector_metadata(first, second)
+    assert out is second
+    assert out.reqs_to_recv == {"a": 1} and out.reqs_to_save == {"b": 2}
+    assert out.reqs_in_batch == {"a", "b"}
+    assert out.scheduler_clock == 2.0  # scalars from the second pass
+
+
+def test_merge_none():
+    m = Meta()
+    assert _merge_connector_metadata(None, m) is m
+    assert _merge_connector_metadata(m, None) is m
+
+
+def params(**kw):
+    base = dict(
+        prompt_logprobs=None,
+        seed=None,
+        presence_penalty=0.0,
+        frequency_penalty=0.0,
+        repetition_penalty=1.0,
+    )
+    base.update(kw)
+    return SimpleNamespace(**base)
+
+
+def test_decode_join_sampling_rules():
+    assert kv_transfer.decode_join_sampling_ok(None)
+    assert kv_transfer.decode_join_sampling_ok(params())
+    assert not kv_transfer.decode_join_sampling_ok(params(seed=3))
+    assert not kv_transfer.decode_join_sampling_ok(params(presence_penalty=0.5))
+    assert not kv_transfer.decode_join_sampling_ok(params(repetition_penalty=1.1))
+    assert not kv_transfer.decode_join_sampling_ok(params(prompt_logprobs=1))
+
+
+class FakeOp:
+    def __init__(self):
+        self.ticket = None
+        self.done = set()
+
+    def take_load_ticket(self):
+        t, self.ticket = self.ticket, None
+        return t
+
+    def load_done(self, t):
+        return t in self.done
+
+
+def test_gate_holds_until_load_done(monkeypatch):
+    op = FakeOp()
+    monkeypatch.setattr(kv_transfer, "_copy_op", op)
+    monkeypatch.setattr(kv_transfer, "_held_recvs", [])
+    out = SimpleNamespace(finished_recving={"r1"})
+    op.ticket = 7
+    kv_transfer.gate_received(out)
+    assert out.finished_recving is None  # load still running: held back
+    out2 = SimpleNamespace(finished_recving=None)
+    op.done.add(7)
+    kv_transfer.gate_received(out2)
+    assert out2.finished_recving == {"r1"}  # released in a later step
+
+
+def test_shadow_caches_are_storage_free():
+    spec = SimpleNamespace(
+        num_kv_heads=8, block_size=64, head_size=128, dtype=torch.bfloat16
+    )
+    cfg = SimpleNamespace(
+        num_blocks=1000,
+        kv_cache_groups=[SimpleNamespace(kv_cache_spec=spec, layer_names=["l0", "l1"])],
+    )
+    caches = kv_transfer.shadow_kv_caches(cfg)
+    assert set(caches) == {"l0", "l1"}
+    t = caches["l0"]
+    assert t.shape == (1000, 8, 64, 256) and t.dtype == torch.bfloat16
+    assert t.untyped_storage().nbytes() == 2  # one element, expanded
+
+
+def test_release_ready_at_sample_time(monkeypatch):
+    op = FakeOp()
+    monkeypatch.setattr(kv_transfer, "_copy_op", op)
+    monkeypatch.setattr(kv_transfer, "_held_recvs", [])
+    out = SimpleNamespace(finished_recving={"r1"})
+    op.ticket = 3
+    kv_transfer.gate_received(out)  # after the lifecycle: load still running
+    assert out.finished_recving is None
+    op.done.add(3)
+    kv_transfer.release_ready(out)  # at sample time, same step
+    assert out.finished_recving == {"r1"}
+
+
+def test_fast_top_k_top_p_matches_upstream():
+    from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p_pytorch
+
+    from vllm_tt_plugin.host_sampler import fast_apply_top_k_top_p
+
+    g = torch.Generator().manual_seed(0)
+    vocab = 32000
+    for scale, temp in (
+        (3.0, 0.6),
+        (1.0, 1.0),
+        (0.2, 1.0),
+        (8.0, 0.3),
+    ):  # sharp ... very flat
+        logits = torch.randn(16, vocab, generator=g) * scale / temp
+        p = torch.rand(16, generator=g) * 0.95 + 0.04
+        for k in (None, torch.randint(1, 300, (16,), generator=g)):
+            ref = apply_top_k_top_p_pytorch(
+                logits.clone(), k, p.clone(), allow_cpu_sync=True
+            )
+            got = fast_apply_top_k_top_p(logits.clone(), k, p.clone())
+            assert torch.equal(torch.isfinite(ref), torch.isfinite(got)), (
+                scale,
+                temp,
+                k is None,
+            )
+            kept = torch.isfinite(ref)
+            assert torch.equal(ref[kept], got[kept])

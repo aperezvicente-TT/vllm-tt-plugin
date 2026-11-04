@@ -37,6 +37,7 @@ from vllm.v1.kv_cache_layout import KVCacheLayout
 from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
+from vllm_tt_plugin import kv_transfer
 from vllm_tt_plugin.config import (
     TT_SCHEDULER_CLS,
     get_tt_config,
@@ -277,6 +278,10 @@ class TTWorker(WorkerBase):
 
     def init_device(self) -> None:
         self._init_tt_device()
+        if kv_transfer.kv_transfer_enabled(self.vllm_config):
+            kv_transfer.init_single_rank_distributed(
+                self.vllm_config, self.distributed_init_method
+            )
         self._init_kv_pool()
         self.model_runner: TTModelRunner = self._create_model_runner()
 
@@ -309,6 +314,11 @@ class TTWorker(WorkerBase):
             self.trace_mode,
             local_dp_rank,
             model_fabric_config=model_capabilities.get("fabric_config"),
+            **(
+                {"num_command_queues": n}
+                if (n := kv_transfer.num_command_queues(self.vllm_config)) > 1
+                else {}
+            ),
         )
         self.device = self.mesh_device
         self.device_config.device = self.mesh_device
@@ -467,6 +477,11 @@ class TTWorker(WorkerBase):
                 dtype=dtype,
                 sliding_window=sliding_window,
             )
+        if kv_transfer.kv_transfer_enabled(self.vllm_config):
+            # Connectors register and transfer per layer name.
+            return {
+                name: attn_spec for name in kv_transfer.layer_names(self.vllm_config)
+            }
         return {"foo": attn_spec}
 
     def determine_available_memory(self) -> int:
@@ -505,7 +520,28 @@ class TTWorker(WorkerBase):
         single-process lane mode has only one rank. Without a token KV cache
         the config has no KV groups.
         """
+        if kv_transfer.kv_transfer_enabled(self.vllm_config):
+            from vllm.distributed.kv_transfer import ensure_kv_transfer_initialized
+
+            ensure_kv_transfer_initialized(self.vllm_config, kv_cache_config)
         self.model_runner.initialize_kv_cache(kv_cache_config)
+        if kv_transfer.kv_transfer_enabled(self.vllm_config):
+            kv_transfer.register_device_caches(
+                self.mesh_device, self.model_runner.kv_caches, kv_cache_config
+            )
+
+    def get_kv_connector_handshake_metadata(self) -> dict | None:
+        from vllm.distributed.kv_transfer import (
+            get_kv_transfer_group,
+            has_kv_transfer_group,
+        )
+
+        if not has_kv_transfer_group():
+            return None
+        metadata = get_kv_transfer_group().get_handshake_metadata()
+        if metadata is None:
+            return None
+        return {(0, 0): metadata}  # one worker rank: pp_rank 0, tp_rank 0
 
     def update_max_model_len(self, max_model_len: int) -> None:
         # The engine calls this via collective_rpc when --max-model-len -1
@@ -1102,7 +1138,12 @@ def _device_open_lock():
 
 
 def open_mesh_device(
-    tt_config, trace_mode, local_dp_rank=0, *, model_fabric_config=None
+    tt_config,
+    trace_mode,
+    local_dp_rank=0,
+    *,
+    model_fabric_config=None,
+    num_command_queues=1,
 ):
     mesh_grid = get_mesh_grid()
     logger.info("Attempting to open mesh device with grid shape %s", mesh_grid)
@@ -1117,6 +1158,7 @@ def open_mesh_device(
         mesh_device = ttnn.open_mesh_device(
             ttnn.MeshShape(*mesh_grid),
             dispatch_core_config=get_dispatch_core_config(tt_config),
+            num_command_queues=num_command_queues,
             **device_params,
         )
     logger.info(

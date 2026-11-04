@@ -1689,6 +1689,17 @@ class TTPlatform(Platform):
         return super().device_id_to_physical_device_id(device_id)
 
     @classmethod
+    def get_attn_backend_cls(
+        cls, selected_backend, attn_selector_config, num_heads=None
+    ) -> str:
+        return "vllm_tt_plugin.kv_transfer.TTAttentionBackend"
+
+    @classmethod
+    def get_nixl_supported_devices(cls) -> dict[str, tuple[str, ...]]:
+        # Host-buffer mode only: NIXL cannot register TT device memory yet.
+        return {"tt": ("cpu",)}
+
+    @classmethod
     def support_hybrid_kv_cache(cls) -> bool:
         # Hybrid models (Gemma3/4, GPT-OSS) opt in to upstream's HMA via
         # ``HybridAttentionForCausalLM.get_kv_cache_spec`` so layers from

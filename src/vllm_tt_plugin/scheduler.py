@@ -15,6 +15,7 @@ from vllm.v1.metrics.stats import SchedulerStats
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 
+from vllm_tt_plugin import kv_transfer
 from vllm_tt_plugin.config import (
     get_tt_adaptive_block_max_prompt_tokens,
     get_tt_block_kv_extent_tokens,
@@ -722,6 +723,52 @@ class TTScheduler(AsyncScheduler):
                 ", ".join(stripped),
             )
 
+    def _joins_decode(self, request: Request) -> bool:
+        """A request whose whole prompt KV arrived from a remote prefill (KV connector).
+
+        Once promoted it has one prompt token left (vLLM recomputes the last token to
+        sample the next), and that token runs in the decode step with the running
+        requests instead of stalling them for a prefill step. Requests that need what
+        only the prefill program does (prompt logprobs, multimodal inputs, device
+        sampling or recurrent state) keep the prefill path. Must agree with the runner's
+        check in ``_prepare_model_inputs``.
+        """
+        if request.status != RequestStatus.WAITING_FOR_REMOTE_KVS:
+            return False
+        rid = request.request_id
+        if (
+            rid not in self.finished_recving_kv_req_ids
+            or rid in self.failed_recving_kv_req_ids
+        ):
+            return False
+        return (
+            request.num_computed_tokens == request.num_tokens
+            and request.num_tokens > 1
+            and not request.mm_features
+            and kv_transfer.decode_join_sampling_ok(request.sampling_params)
+            and not self._has_recurrent_state()
+        )
+
+    def _has_recurrent_state(self) -> bool:
+        from vllm.v1.kv_cache_interface import MambaSpec
+
+        return any(
+            isinstance(g.kv_cache_spec, MambaSpec)
+            for g in self.kv_cache_config.kv_cache_groups
+        )
+
+    def _split_kv_holding(self) -> tuple[list[Request], list[Request]]:
+        """``kv_holding_waiting`` split into (requests that join the next decode
+        step, everything else). Requests waiting for remote KV live there: they
+        hold the blocks their KV is received into."""
+        holding = self.kv_holding_waiting
+        if not holding or getattr(self, "connector", None) is None:
+            return [], list(holding)
+        joins, rest = [], []
+        for r in holding:
+            (joins if self._joins_decode(r) else rest).append(r)
+        return joins, rest
+
     def _has_pending_prefill(self) -> bool:
         """Whether any request still needs prefill work.
 
@@ -733,9 +780,20 @@ class TTScheduler(AsyncScheduler):
         A running ``is_prefill_chunk`` request is a partial prefill whose next
         chunk can only be scheduled by a prefill step.
         """
+        # With a KV connector, a request still waiting for its remote KV has no
+        # work yet, and one that will join decode needs no prefill step.
+        if getattr(self, "connector", None) is None:
+            kv_holding_pending = bool(self.kv_holding_waiting)
+        else:
+            _, rest = self._split_kv_holding()
+            kv_holding_pending = any(
+                r.status != RequestStatus.WAITING_FOR_REMOTE_KVS
+                or r.request_id in self.finished_recving_kv_req_ids
+                for r in rest
+            )
         return (
             bool(self.waiting)
-            or bool(self.kv_holding_waiting)
+            or kv_holding_pending
             or any(request.is_prefill_chunk for request in self.running)
         )
 
@@ -883,6 +941,11 @@ class TTScheduler(AsyncScheduler):
                     result.preempted_req_ids = (
                         result.preempted_req_ids or set()
                     ) | prefill_result.preempted_req_ids
+                # The prefill pass consumed the connector's pending work (e.g. a
+                # decode node's queued KV reads); keep it.
+                result.kv_connector_metadata = _merge_connector_metadata(
+                    prefill_result.kv_connector_metadata, result.kv_connector_metadata
+                )
                 return self._finalize_scheduler_output(result, is_decode=True)
             self._decode_interleave.record_step(is_decode=False, prefill_pending=True)
             return self._finalize_scheduler_output(prefill_result, is_decode=False)
@@ -929,12 +992,23 @@ class TTScheduler(AsyncScheduler):
         self.running = cast(list[Request], partial_prefills)
         self.max_num_running_reqs = max(0, saved_max - len(pure_decodes))
         self.max_num_active_reqs = max(0, saved_active - len(pure_decodes))
+        # Requests that join decode are left to the decode pass.
+        joins, rest = self._split_kv_holding()
+        saved_kv_holding = self.kv_holding_waiting
+        if joins:
+            self.kv_holding_waiting = _queue_of(self.policy, rest)
         try:
             result = super().schedule()
         finally:
             self.running.extend(pure_decodes)
             self.max_num_running_reqs = saved_max
             self.max_num_active_reqs = saved_active
+            if joins:
+                # Whatever of ``rest`` the pass did not admit goes back, ahead of
+                # the joins, as the base scheduler requeues skipped requests.
+                saved_kv_holding.remove_requests(rest)
+                saved_kv_holding.prepend_requests(self.kv_holding_waiting)
+                self.kv_holding_waiting = saved_kv_holding
         return result
 
     def _schedule_decode_only(self) -> SchedulerOutput:
@@ -946,13 +1020,20 @@ class TTScheduler(AsyncScheduler):
         this decode step, and hides partial prefills so their next chunk is not
         scheduled into it either.  Any requests that get preempted during
         decode scheduling are merged back into the original queues afterwards.
+        The exception is a request that joins decode (``_joins_decode``): its
+        remote KV has arrived and it needs one token, so it stays visible.
         """
         partial_prefills = [r for r in self.running if r.is_prefill_chunk]
 
         saved_waiting = self.waiting
         saved_kv_holding = self.kv_holding_waiting
+        joins, _ = self._split_kv_holding()
         self.waiting = create_request_queue(self.policy)
-        self.kv_holding_waiting = create_request_queue(self.policy)
+        # Only requests whose remote KV is ready and that need one decode token
+        # are visible to the decode pass.
+        if joins:
+            saved_kv_holding.remove_requests(joins)
+        self.kv_holding_waiting = _queue_of(self.policy, joins)
         if partial_prefills:
             self.running = [r for r in self.running if not r.is_prefill_chunk]
         try:
@@ -1330,3 +1411,35 @@ class TTScheduler(AsyncScheduler):
                 "Output placeholders underflowed after block-output reconciliation"
             )
         return new_token_ids, stopped
+
+
+def _merge_connector_metadata(first, second):
+    """Merge the metadata of two scheduling passes of one step.
+
+    Connector metadata is a bag of per-request dicts and sets (NixlConnectorMetadata:
+    reqs_to_recv, reqs_to_save, reqs_in_batch, ...). Containers are merged with the
+    second pass winning on key conflicts; scalars come from the second pass.
+    """
+    if first is None or second is None:
+        return second if first is None else first
+    if type(first) is not type(second):
+        raise TypeError(
+            f"cannot merge connector metadata {type(first).__name__} and "
+            f"{type(second).__name__}"
+        )
+    for name, a in vars(first).items():
+        b = getattr(second, name, None)
+        if isinstance(a, dict) and isinstance(b, dict):
+            setattr(second, name, {**a, **b})
+        elif isinstance(a, set) and isinstance(b, set):
+            setattr(second, name, a | b)
+        elif isinstance(a, list) and isinstance(b, list):
+            setattr(second, name, a + b)
+    return second
+
+
+def _queue_of(policy, requests):
+    q = create_request_queue(policy)
+    for r in requests:
+        q.add_request(r)
+    return q
