@@ -297,6 +297,24 @@ def _notify_model_slot_moves(runner, moves: dict[int, int]) -> None:
 _SUPPORTED_MM_MODALITIES = frozenset({"image", "video", "audio"})
 
 
+# vLLM treats temperatures below this as greedy (vllm.v1.sample.sampler _SAMPLING_EPS).
+_GREEDY_TEMPERATURE = 1e-5
+
+
+def greedy_from_candidates(values: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+    """argmax with vLLM's tie rule (the lowest vocabulary id among equal maxima) from
+    top-K candidates: every value equal to a row's maximum is among its candidates,
+    whatever order the device's top-K returned them in."""
+    top = values.max(dim=-1, keepdim=True).values
+    big = torch.iinfo(torch.long).max
+    ids = torch.where(
+        values == top,
+        indices.to(torch.long),
+        torch.full_like(indices, big, dtype=torch.long),
+    )
+    return ids.min(dim=-1).values
+
+
 class TTModelRunner:
     def __init__(
         self,
@@ -4140,13 +4158,15 @@ class TTModelRunner:
             (sampling.seed[rows] != SEED_NONE_SENTINEL).any()
         ):
             return False
-        if not bool((sampling.temperature[rows] > 0).all()):
-            return False
+        temperature = sampling.temperature[rows]
+        greedy = temperature < _GREEDY_TEMPERATURE
         top_k = sampling.top_k[rows]
         cut_inside = (top_k <= int(capability["k"])) | (
             (top_k >= self.vocab_size) & (sampling.top_p[rows] < 1.0)
         )
-        return bool(cut_inside.all())
+        # Greedy rows need only the top candidate (and its ties, which are all among the
+        # top K).
+        return bool((greedy | ((temperature > 0) & cut_inside)).all())
 
     def submit_prefill(
         self,
@@ -4587,6 +4607,21 @@ class TTModelRunner:
         assert isinstance(sampling_params.temperature, torch.Tensor)
         assert isinstance(sampling_params.top_k, torch.Tensor)
         assert isinstance(sampling_params.top_p, torch.Tensor)
+        greedy = sampling_params.temperature[rows] < _GREEDY_TEMPERATURE
+        if bool(greedy.any()):
+            out = torch.empty(len(rows), dtype=torch.long)
+            g = greedy.nonzero().view(-1)
+            out[g] = greedy_from_candidates(
+                candidates.values[rows[g]], candidates.indices[rows[g]]
+            )
+            s = (~greedy).nonzero().view(-1)
+            if len(s):
+                out[s] = (
+                    self._sample_host_candidates(candidates, rows[s], sampling_params)
+                    .view(-1)
+                    .to(torch.long)
+                )
+            return out.to(torch.int32).view(-1, 1)
         temperature = sampling_params.temperature[rows].to(torch.float32).unsqueeze(1)
         top_k = sampling_params.top_k[rows]
         top_p = sampling_params.top_p[rows]

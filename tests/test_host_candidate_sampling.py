@@ -226,7 +226,12 @@ def _rows(temperature=0.8, top_k=128000, top_p=0.9):
         (0.8, K + 1, 1.0, False),  # top-k wider than the candidates, no top-p
         (0.8, 128000, 1.0, False),  # plain temperature sampling needs the whole row
         (0.8, 1000, 0.9, False),  # top-p over a top-k set wider than the candidates
-        (0.0, 1, 0.0, False),  # greedy keeps the bitwise argmax path
+        (
+            0.0,
+            1,
+            0.0,
+            True,
+        ),  # greedy: top candidate with argmax's tie rule (bitwise the same token)
         (1.0, 1, 0.0, True),  # top_k=1 at T > 0
     ],
 )
@@ -237,7 +242,8 @@ def test_routing_by_sampling_params(temperature, top_k, top_p, expected):
 
 def test_one_row_off_the_candidate_path_routes_the_whole_step():
     sampling = _rows()
-    sampling.temperature[2] = 0.0
+    sampling.top_k[2] = 128000  # plain temperature sampling: needs the whole row
+    sampling.top_p[2] = 1.0
     runner = _routing_runner(sampling)
     assert TTModelRunner.check_host_candidate_sampling(runner, [0, 1])
     assert not TTModelRunner.check_host_candidate_sampling(runner, [0, 2])
@@ -423,3 +429,20 @@ def test_full_logits_submission_keeps_its_call_shape():
 
     assert "host_candidates" not in model.calls[-1]
     assert "candidate_temperature" not in model.calls[-1]
+
+
+def test_greedy_from_candidates_matches_argmax_tie_rule():
+    import torch
+
+    from vllm_tt_plugin.model_runner import greedy_from_candidates
+
+    g = torch.Generator().manual_seed(0)
+    logits = torch.randn(16, 5000, generator=g).to(torch.bfloat16)
+    logits[3, 17] = logits[3, 4000] = logits[3].max() + 1  # a tie: argmax picks 17
+    vals, idx = torch.topk(logits.float(), 256, dim=-1)
+    perm = torch.randperm(
+        256, generator=g
+    )  # device top-K order among ties is not guaranteed
+    got = greedy_from_candidates(vals[:, perm], idx[:, perm])
+    assert torch.equal(got, logits.float().argmax(dim=-1))
+    assert int(got[3]) == 17
