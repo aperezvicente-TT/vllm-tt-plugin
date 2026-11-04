@@ -77,22 +77,47 @@ def shadow_kv_caches(kv_cache_config: KVCacheConfig) -> dict[str, torch.Tensor]:
     """Storage-free per-layer tensors with the logical paged-cache shape connectors size
     from.
 
-    Shape is [num_blocks, num_kv_heads, block_size, 2 * head_size]: K and V of one block
-    packed in the last dimension, as upstream's packed host layout expects. Only shape
-    and dtype are read.
+    Shape is [num_blocks, num_kv_heads, block_size, C]: K and V of one block packed in
+    the last dimension, as upstream's packed host layout expects; C is 2 * head_size
+    elements, or the spec's packed bytes per (head, token) in uint8 for block-float
+    device caches. Only shape and dtype are read.
     """
     out: dict[str, torch.Tensor] = {}
     for group in kv_cache_config.kv_cache_groups:
         spec = group.kv_cache_spec
-        shape = (
-            kv_cache_config.num_blocks,
-            spec.num_kv_heads,
-            spec.block_size,
-            2 * spec.head_size,
-        )
+        packed = getattr(spec, "state_content_bytes", None)
+        last = packed if packed is not None else 2 * spec.head_size
+        dtype = torch.uint8 if packed is not None else spec.dtype
+        shape = (kv_cache_config.num_blocks, spec.num_kv_heads, spec.block_size, last)
         for name in group.layer_names:
-            out[name] = torch.empty((1,), dtype=spec.dtype).expand(shape)
+            out[name] = torch.empty((1,), dtype=dtype).expand(shape)
     return out
+
+
+# Bytes of one 32x32 tile on the device for block-float formats (shared exponents per 16
+# values).
+_BLOCK_FLOAT_TILE_BYTES = {"bfloat8_b": 1088, "bfloat4_b": 576}
+
+
+def device_kv_spec(spec, device_dtype: str):
+    """The KV spec whose pages match the device cache bytes of one layer.
+
+    Block-float caches pack each 32x32 tile with shared exponents, so a block holds more
+    bytes than one per element: the spec declares them as packed uint8 content
+    (`state_content_bytes`, K and V per head and token), which upstream connectors size
+    host buffers and transfers from.
+    """
+    import dataclasses
+
+    tile = _BLOCK_FLOAT_TILE_BYTES.get(device_dtype)
+    if tile is None:
+        return spec
+    if spec.head_size % 32 or spec.block_size % 32:
+        raise ValueError(
+            f"{device_dtype} KV needs head_size and block_size multiples of 32"
+        )
+    per_token = 2 * (spec.head_size // 32) * tile // 32
+    return dataclasses.replace(spec, dtype=torch.uint8, state_content_bytes=per_token)
 
 
 def init_single_rank_distributed(vllm_config: VllmConfig, init_method: str) -> None:

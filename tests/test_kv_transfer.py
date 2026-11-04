@@ -176,3 +176,24 @@ def test_copy_op_built_before_caches_registered(monkeypatch):
         ("register", "OP"),
         ("ops", "OP"),
     ]  # the op existed when caches were registered
+
+
+def test_block_float_spec_and_shadow_bytes():
+    from vllm.v1.kv_cache_interface import FullAttentionSpec
+
+    base = FullAttentionSpec(
+        block_size=64, num_kv_heads=8, head_size=128, dtype=torch.bfloat16
+    )
+    assert kv_transfer.device_kv_spec(base, "bfloat16") is base
+    spec = kv_transfer.device_kv_spec(base, "bfloat8_b")
+    # 2 (K, V) x 4 tiles across the head x 1088 bytes per tile / 32 rows
+    assert spec.state_content_bytes == 272 and spec.dtype == torch.uint8
+    tiles_per_block = 2 * 8 * (64 // 32) * (128 // 32)
+    assert spec.page_size_bytes == tiles_per_block * 1088
+    cfg = SimpleNamespace(
+        num_blocks=10,
+        kv_cache_groups=[SimpleNamespace(kv_cache_spec=spec, layer_names=["l0"])],
+    )
+    sh = kv_transfer.shadow_kv_caches(cfg)["l0"]
+    assert sh.dtype == torch.uint8 and sh.shape == (10, 8, 64, 272)
+    assert sh.numel() == 10 * spec.page_size_bytes

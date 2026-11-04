@@ -478,9 +478,21 @@ class TTWorker(WorkerBase):
                 sliding_window=sliding_window,
             )
         if kv_transfer.kv_transfer_enabled(self.vllm_config):
-            # Connectors register and transfer per layer name.
+            # Connectors register and transfer per layer name, and size host buffers
+            # from the spec: with the model's own KV dtype ("auto"), take each layer's
+            # device dtype from the model.
+            names = kv_transfer.layer_names(self.vllm_config)
+            model = getattr(self.model_runner, "model", None)
+            dtypes = None
+            if cache_config.cache_dtype == "auto" and hasattr(
+                model, "kv_cache_device_dtypes"
+            ):
+                dtypes = model.kv_cache_device_dtypes()
+            if dtypes is None:
+                return {name: attn_spec for name in names}
             return {
-                name: attn_spec for name in kv_transfer.layer_names(self.vllm_config)
+                name: kv_transfer.device_kv_spec(attn_spec, dt)
+                for name, dt in zip(names, dtypes)
             }
         return {"foo": attn_spec}
 
