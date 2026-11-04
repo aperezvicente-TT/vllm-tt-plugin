@@ -165,18 +165,20 @@ def state_shadow(spec, num_blocks: int) -> torch.Tensor:
 _BLOCK_FLOAT_TILE_BYTES = {"bfloat8_b": 1088, "bfloat4_b": 576}
 
 
-def device_kv_spec(spec, device_dtype: str):
-    """The KV spec whose pages match the device cache bytes of one layer.
+def device_kv_spec(spec, device_dtype: str, wire_layout: str | None = None):
+    """The KV spec whose pages match the host-buffer bytes of one layer.
 
     Block-float caches pack each 32x32 tile with shared exponents, so a block holds more
     bytes than one per element: the spec declares them as packed uint8 content
     (`state_content_bytes`, K and V per head and token), which upstream connectors size
-    host buffers and transfers from.
+    host buffers and transfers from. With a wire layout the host buffers hold the spec's
+    own dtype whatever the device stores (the copy op converts block-float on the way),
+    so the spec is unchanged.
     """
     import dataclasses
 
     tile = _BLOCK_FLOAT_TILE_BYTES.get(device_dtype)
-    if tile is None:
+    if tile is None or wire_layout is not None:
         return spec
     if spec.head_size % 32 or spec.block_size % 32:
         raise ValueError(

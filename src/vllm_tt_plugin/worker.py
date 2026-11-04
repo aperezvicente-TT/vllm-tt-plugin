@@ -494,8 +494,9 @@ class TTWorker(WorkerBase):
                 dtypes = model.kv_cache_device_dtypes()
             if dtypes is None:
                 return {name: attn_spec for name in names}
+            wire = kv_transfer.host_buffer_wire_layout(self.vllm_config)
             return {
-                name: kv_transfer.device_kv_spec(attn_spec, dt)
+                name: kv_transfer.device_kv_spec(attn_spec, dt, wire)
                 for name, dt in zip(names, dtypes)
             }
         return {"foo": attn_spec}

@@ -220,6 +220,20 @@ def test_block_float_spec_and_shadow_bytes():
     assert sh.numel() == 10 * spec.page_size_bytes
 
 
+def test_wire_layout_spec_is_the_wire_dtype():
+    """With a wire layout host buffers hold bf16 rows whatever the device stores, so
+    bf16 and bfloat8_b caches declare the same spec: the same host buffers, NIXL block
+    lengths and pages."""
+    from vllm.v1.kv_cache_interface import FullAttentionSpec
+
+    base = FullAttentionSpec(
+        block_size=64, num_kv_heads=8, head_size=128, dtype=torch.bfloat16
+    )
+    for dt in ("bfloat16", "bfloat8_b"):
+        spec = kv_transfer.device_kv_spec(base, dt, "LBHNC")
+        assert spec is base and spec.page_size_bytes == 2 * 8 * 64 * 128 * 2
+
+
 # Streamed saves: a chunk's save overlaps the next chunk; only the step that completes a
 # prompt waits.
 
