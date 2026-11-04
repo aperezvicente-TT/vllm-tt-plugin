@@ -290,6 +290,36 @@ def handle_preemptions(scheduler_output) -> None:
         get_kv_transfer_group().handle_preemptions(meta)
 
 
+def note_block_ids(scheduler_output) -> None:
+    """Tell the copy op which KV cache group owns the blocks this step may copy
+    (optional protocol: ``note_block_ids(block_ids)`` per request, vLLM's per-group
+    ``BlockIds``).
+
+    With several groups sharing one block pool (hybrid models), host-buffer connectors
+    copy one group's blocks per call but hand over every layer; knowing the owner lets
+    the copy op move only that group's layers. Saves copy blocks scheduled in this step;
+    loads copy blocks the connector metadata names (``reqs_to_recv`` / ``reqs_to_save``
+    entries with ``local_block_ids``).
+    """
+    op = _copy_op
+    note = getattr(op, "note_block_ids", None)
+    if note is None:
+        return
+    for r in scheduler_output.scheduled_new_reqs:
+        note(r.block_ids)
+    for ids in scheduler_output.scheduled_cached_reqs.new_block_ids or ():
+        note(ids)
+    pending = [getattr(scheduler_output, "kv_connector_metadata", None)]
+    while pending:
+        meta = pending.pop()
+        children = getattr(meta, "metadata", None)
+        if isinstance(children, tuple):  # MultiConnector: one child per connector
+            pending.extend(children)
+        for attr in ("reqs_to_recv", "reqs_to_save"):
+            for m in (getattr(meta, attr, None) or {}).values():
+                note(getattr(m, "local_block_ids", None))
+
+
 def wait_saves_of_freed(scheduler_output) -> None:
     """Before a step's loads and forward, wait for running saves of requests whose
     blocks were freed since the last step (finished early, aborted or preempted).

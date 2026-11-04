@@ -3345,6 +3345,7 @@ class TTModelRunner:
             )
         kv_transfer.handle_preemptions(scheduler_output)
         kv_transfer.wait_saves_of_freed(scheduler_output)
+        kv_transfer.note_block_ids(scheduler_output)
         with (
             set_forward_context(None, self.vllm_config),
             KVConnectorModelRunnerMixin._get_kv_connector_output(

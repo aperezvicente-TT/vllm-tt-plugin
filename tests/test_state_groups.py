@@ -104,3 +104,26 @@ def test_state_shadow_is_one_page_per_block():
         == 5 * ATTN.page_size_bytes
         == 5 * STATE.page_size_bytes
     )
+
+
+def test_copy_op_learns_block_owners(monkeypatch):
+    """Scheduled requests' blocks and the connector metadata's received blocks reach the
+    copy op, one per-group BlockIds per request."""
+    seen = []
+    monkeypatch.setattr(
+        kv_transfer, "_copy_op", SimpleNamespace(note_block_ids=seen.append)
+    )
+    out = SimpleNamespace(
+        scheduled_new_reqs=[SimpleNamespace(block_ids=([5], [1, 2], [6]))],
+        scheduled_cached_reqs=SimpleNamespace(new_block_ids=[None, ([], [3], [])]),
+        kv_connector_metadata=SimpleNamespace(
+            reqs_to_recv={"r": SimpleNamespace(local_block_ids=([7], [8, 9], [10]))},
+            reqs_to_save={},
+        ),
+    )
+    kv_transfer.note_block_ids(out)
+    assert seen == [([5], [1, 2], [6]), None, ([], [3], []), ([7], [8, 9], [10])]
+    monkeypatch.setattr(
+        kv_transfer, "_copy_op", SimpleNamespace()
+    )  # an op without the protocol
+    kv_transfer.note_block_ids(out)
