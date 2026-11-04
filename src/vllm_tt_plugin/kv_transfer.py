@@ -142,15 +142,27 @@ def register_device_caches(
     if not has_kv_transfer_group():
         return
     connector = get_kv_transfer_group()
-    connector.register_kv_caches(shadow_kv_caches(kv_cache_config))
     if _copy_op_provider is None:
         raise RuntimeError(
             "A KV connector is configured but no TT copy-op provider is registered; "
             "install the tt-kv package"
         )
+    # The copy op first: connectors may compute their P/D compatibility check while
+    # registering caches, and the copy op's layout is part of it (see
+    # kv_transfer_compat_factors).
     global _copy_op
     _copy_op = _copy_op_provider(mesh_device, device_caches, kv_cache_config)
+    connector.register_kv_caches(shadow_kv_caches(kv_cache_config))
     connector.set_host_xfer_buffer_ops(_copy_op)
+
+
+def kv_transfer_compat_factors() -> dict[str, str]:
+    """Factors P and D must agree on beyond upstream's: the device cache layout the copy
+    op moves. Empty before the copy op exists or if it does not describe its layout."""
+    op = _copy_op
+    if op is None or not hasattr(op, "layout_hash"):
+        return {}
+    return {"tt_kv_layout": op.layout_hash()}
 
 
 def num_command_queues(vllm_config: VllmConfig) -> int:

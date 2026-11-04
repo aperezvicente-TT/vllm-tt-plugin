@@ -137,3 +137,42 @@ def test_fast_top_k_top_p_matches_upstream():
             )
             kept = torch.isfinite(ref)
             assert torch.equal(ref[kept], got[kept])
+
+
+def test_compat_factors_from_copy_op(monkeypatch):
+    monkeypatch.setattr(kv_transfer, "_copy_op", None)
+    assert kv_transfer.kv_transfer_compat_factors() == {}
+    monkeypatch.setattr(
+        kv_transfer, "_copy_op", SimpleNamespace(layout_hash=lambda: "abc")
+    )
+    assert kv_transfer.kv_transfer_compat_factors() == {"tt_kv_layout": "abc"}
+
+
+def test_copy_op_built_before_caches_registered(monkeypatch):
+    order = []
+
+    class Conn:
+        def register_kv_caches(self, caches):
+            order.append(("register", kv_transfer._copy_op))
+
+        def set_host_xfer_buffer_ops(self, op):
+            order.append(("ops", op))
+
+    import vllm.distributed.kv_transfer as kvt
+
+    monkeypatch.setattr(kvt, "has_kv_transfer_group", lambda: True)
+    monkeypatch.setattr(kvt, "get_kv_transfer_group", lambda: Conn())
+    monkeypatch.setattr(kv_transfer, "_copy_op_provider", lambda m, c, cfg: "OP")
+    monkeypatch.setattr(kv_transfer, "_copy_op", None)
+    spec = SimpleNamespace(
+        num_kv_heads=1, block_size=4, head_size=8, dtype=torch.bfloat16
+    )
+    cfg = SimpleNamespace(
+        num_blocks=2,
+        kv_cache_groups=[SimpleNamespace(kv_cache_spec=spec, layer_names=["l0"])],
+    )
+    kv_transfer.register_device_caches(None, {}, cfg)
+    assert order == [
+        ("register", "OP"),
+        ("ops", "OP"),
+    ]  # the op existed when caches were registered

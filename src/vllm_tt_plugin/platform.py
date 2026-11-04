@@ -1700,6 +1700,14 @@ class TTPlatform(Platform):
         return {"tt": ("cpu",)}
 
     @classmethod
+    def get_kv_transfer_compat_factors(cls) -> dict[str, str]:
+        # Proposed upstream hook: KV connectors add these to their P/D compatibility
+        # hash, so P and D refuse to pair when their device cache layouts differ.
+        from vllm_tt_plugin import kv_transfer
+
+        return kv_transfer.kv_transfer_compat_factors()
+
+    @classmethod
     def support_hybrid_kv_cache(cls) -> bool:
         # Hybrid models (Gemma3/4, GPT-OSS) opt in to upstream's HMA via
         # ``HybridAttentionForCausalLM.get_kv_cache_spec`` so layers from
