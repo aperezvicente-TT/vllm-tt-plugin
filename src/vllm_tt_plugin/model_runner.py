@@ -21,6 +21,7 @@ from vllm.utils.math_utils import cdiv
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVCacheConfig,
+    MambaSpec,
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.outputs import (
@@ -316,6 +317,12 @@ def greedy_from_candidates(values: torch.Tensor, indices: torch.Tensor) -> torch
 
 
 class TTModelRunner:
+    # Set by initialize_kv_cache (_init_state_groups).
+    _primary_group = 0
+    _state_groups: tuple[int, ...] = ()
+    _state_layers: dict[int, int] = {}
+    transfer_kv_caches: dict[str, Any] | None = None
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -699,6 +706,10 @@ class TTModelRunner:
         # overestimates for the larger-block groups (extra block-table
         # rows allocated, never indexed).
         per_group_block_sizes = [g.kv_cache_spec.block_size for g in kv_cache_groups]
+        # Recurrent-state (MambaSpec) groups: see _init_state_groups.
+        kernel_block_sizes = self._init_state_groups(
+            kv_cache_groups, per_group_block_sizes
+        )
 
         max_num_reqs = self.tt_max_batch_size
         max_model_len = self.model_config.max_model_len
@@ -717,7 +728,7 @@ class TTModelRunner:
                 max_num_batched_tokens=max_num_batched_tokens,
                 vocab_size=self.vocab_size,
                 block_sizes=per_group_block_sizes,
-                kernel_block_sizes=per_group_block_sizes,
+                kernel_block_sizes=kernel_block_sizes,
                 logitsprocs=self._host_logitsprocs,
                 disable_logprobs=self._is_block_output_model,
                 output_tokens_per_step=self._output_tokens_per_step,
@@ -729,7 +740,7 @@ class TTModelRunner:
                 max_num_batched_tokens=max_num_batched_tokens,
                 vocab_size=self.vocab_size,
                 block_sizes=per_group_block_sizes,
-                kernel_block_sizes=per_group_block_sizes,
+                kernel_block_sizes=kernel_block_sizes,
                 logitsprocs=self._host_logitsprocs,
                 disable_logprobs=self._is_block_output_model,
                 output_tokens_per_step=self._output_tokens_per_step,
@@ -743,6 +754,13 @@ class TTModelRunner:
             cdiv(max_model_len, self.cache_config.block_size),
             kv_cache_config.num_blocks,
         )
+        if self._state_groups:
+            # The attention table holds kernel blocks (vLLM maps each block to several).
+            kernel = kernel_block_sizes[self._primary_group]
+            ratio = per_group_block_sizes[self._primary_group] // kernel
+            self.max_num_blocks_per_req = min(
+                cdiv(max_model_len, kernel), kv_cache_config.num_blocks * ratio
+            )
 
         # Cache layer→group index mapping for hybrid models so submit_*
         # can expand ``block_tables_per_group`` into ``block_tables_per_layer``
@@ -753,7 +771,7 @@ class TTModelRunner:
         # local parallel config is collapsed to DP=1 by upstream before the TT
         # worker loads the model.
         self._layer_to_group_idx: list[int] | None = None
-        if len(kv_cache_groups) > 1:
+        if len(kv_cache_groups) > 1 and not self._state_groups:
             num_layers = self.model_config.get_num_layers_by_block_type(
                 self.parallel_config, "attention"
             )
@@ -771,7 +789,118 @@ class TTModelRunner:
                 )
             self._layer_to_group_idx = mapping  # type: ignore[assignment]
 
-        self.kv_caches = self._allocate_kv_caches(kv_cache_config)
+        if self._state_groups:
+            self.kv_caches = self._allocate_state_hybrid_caches(
+                kv_cache_config, kernel_block_sizes[self._primary_group]
+            )
+        else:
+            self.kv_caches = self._allocate_kv_caches(kv_cache_config)
+
+    def _init_state_groups(
+        self, kv_cache_groups: list, block_sizes: list[int]
+    ) -> list[int]:
+        """Find recurrent-state (``MambaSpec``) groups and return each group's kernel
+        block size.
+
+        A hybrid attention + state model declares its attention layers with the block
+        size its attention kernels use. vLLM then raises the attention group's block
+        size so an attention page is as large as a state page (one shared block pool);
+        the kernel keeps its own block size, and the block table maps each vLLM block to
+        consecutive kernel blocks, as on GPUs. Models with state groups have one
+        attention group, whose table is the ``page_table`` the model receives; each
+        request's state slot is the block of its state group.
+        """
+        self._state_groups = [
+            i
+            for i, g in enumerate(kv_cache_groups)
+            if isinstance(g.kv_cache_spec, MambaSpec)
+        ]
+        self._primary_group = 0
+        self._state_layers: dict[int, int] = {}  # model layer index -> state group
+        if not self._state_groups:
+            return block_sizes
+        attn = [i for i in range(len(kv_cache_groups)) if i not in self._state_groups]
+        if len(attn) != 1:
+            raise NotImplementedError(
+                "recurrent-state models need exactly one attention KV cache group, "
+                f"got {len(attn)}"
+            )
+        self._primary_group = attn[0]
+        for g in self._state_groups:
+            for name in kv_cache_groups[g].layer_names:
+                self._state_layers[_parse_layer_index(name)] = g
+        hook = getattr(type(self.model), "get_kv_cache_spec", None)
+        declared = hook(self.vllm_config) if hook is not None else None
+        attn_names = kv_cache_groups[self._primary_group].layer_names
+        kernel = (
+            declared[attn_names[0]].block_size
+            if declared
+            else block_sizes[self._primary_group]
+        )
+        if block_sizes[self._primary_group] % kernel:
+            raise ValueError(
+                f"attention block size {block_sizes[self._primary_group]} is not a "
+                f"multiple of the kernel block size {kernel}"
+            )
+        sizes = list(block_sizes)
+        sizes[self._primary_group] = kernel
+        return sizes
+
+    def _allocate_state_hybrid_caches(
+        self, kv_cache_config: KVCacheConfig, kernel_block: int
+    ) -> Any:
+        """Attention caches through the model's ``allocate_kv_cache`` (in kernel blocks)
+        and the recurrent-state slots through ``allocate_state_cache(num_blocks)``.
+
+        Every layer gets its own buffers: block ``b`` of a layer is its bytes for vLLM
+        block ``b``, whichever group owns ``b``. ``self.transfer_kv_caches`` maps each
+        vLLM layer name to its buffers, for KV connectors; the model's forward receives
+        the attention caches.
+        """
+        alloc_state = getattr(self.model, "allocate_state_cache", None)
+        if alloc_state is None:
+            raise NotImplementedError(
+                f"{type(self.model).__name__} declares recurrent-state KV cache groups "
+                "but has no allocate_state_cache(num_blocks)"
+            )
+        group = kv_cache_config.kv_cache_groups[self._primary_group]
+        spec = group.kv_cache_spec
+        num_blocks = kv_cache_config.num_blocks
+        ratio = spec.block_size // kernel_block
+        shape = self._kv_cache_shape(spec, num_blocks)
+        shape = (num_blocks * ratio, shape[1], kernel_block, shape[3])
+        attn_names = sorted(group.layer_names, key=_parse_layer_index)
+        attn = self.model.allocate_kv_cache(
+            shape, spec.dtype, len(attn_names), **self._engine_kv_cache_dtype_kwargs()
+        )
+        state = alloc_state(num_blocks)
+        caches = dict(zip(attn_names, attn))
+        for g in self._state_groups:
+            for name in kv_cache_config.kv_cache_groups[g].layer_names:
+                caches[name] = state[_parse_layer_index(name)]
+        self.transfer_kv_caches = caches
+        return attn
+
+    def _mamba_state_indices(
+        self, block_tables_per_group: list[torch.Tensor], num_rows: int
+    ) -> list[dict[int, int]] | None:
+        """Per row, ``{model layer index: block id of the request's state slot}``. With
+        ``mamba_cache_mode="none"`` a request holds one block per state group, the
+        running state."""
+        if not getattr(self, "_state_groups", ()):
+            return None
+        if self.cache_config.mamba_cache_mode != "none":
+            raise NotImplementedError(
+                "TT recurrent-state groups support mamba_cache_mode 'none' only"
+            )
+        cols = {
+            g: block_tables_per_group[g][:num_rows, 0].tolist()
+            for g in self._state_groups
+        }
+        return [
+            {layer: int(cols[g][row]) for layer, g in self._state_layers.items()}
+            for row in range(num_rows)
+        ]
 
     @staticmethod
     def _validate_kv_cache_groups(kv_cache_groups: list) -> None:
@@ -786,7 +915,7 @@ class TTModelRunner:
             # full layers 1x512). We unwrap it to per-layer specs in
             # ``_build_per_layer_specs``, so accept it here too.
             if not isinstance(
-                group.kv_cache_spec, (AttentionSpec, UniformTypeKVCacheSpecs)
+                group.kv_cache_spec, (AttentionSpec, UniformTypeKVCacheSpecs, MambaSpec)
             ):
                 raise TypeError(
                     f"Expected AttentionSpec/UniformTypeKVCacheSpecs for group "
@@ -2348,7 +2477,7 @@ class TTModelRunner:
         # ``page_tables_per_group`` kwarg in submit_prefill / submit_decode; the
         # legacy generator_vllm wrappers strip it on the way through and raise
         # loudly if the list has more than one entry.
-        block_tables = block_tables_per_group[0]
+        block_tables = block_tables_per_group[getattr(self, "_primary_group", 0)]
 
         # NOTE: We assume that all sequences in the group are all prompts or
         # all decodes.
@@ -2540,7 +2669,9 @@ class TTModelRunner:
                     )
                     for bt in block_tables_per_group
                 ]
-                block_tables = block_tables_per_group[0]
+                block_tables = block_tables_per_group[
+                    getattr(self, "_primary_group", 0)
+                ]
                 # Sampling parameters are intentionally NOT padded here. The
                 # per-row wire tensors are built below by
                 # ``_sampling_params_for_padded_decode``, which takes this
@@ -2731,12 +2862,16 @@ class TTModelRunner:
             # whenever device sampling is enabled.
 
         block_tables_per_group = [bt.contiguous() for bt in block_tables_per_group]
-        block_tables = block_tables_per_group[0]
+        block_tables = block_tables_per_group[getattr(self, "_primary_group", 0)]
         # State follows the request, not the row (``self._req_state_slot``), which
         # subsumes the batch's condense-move remap.
         input_batch.reset_slot_remap()
         prefill_empty_slots = None
         slot_remap = None
+        mamba_state_indices = TTModelRunner._mamba_state_indices(
+            self, block_tables_per_group, len(row_req_ids)
+        )
+        state_imports = None
         if is_prompt:
             prefill_empty_slots = self._alloc_prefill_state_slots(row_req_ids)
         else:
@@ -2747,6 +2882,14 @@ class TTModelRunner:
                 self._alloc_prefill_state_slots(
                     [r for r in row_req_ids if r in joining]
                 )
+                # Recurrent state arrived with the KV (its state slots); the model loads
+                # it into the request's device slot before the decode reads it.
+                if mamba_state_indices is not None:
+                    rows = [i for i, r in enumerate(row_req_ids) if r in joining]
+                    state_imports = (
+                        [self._req_state_slot[row_req_ids[i]] for i in rows],
+                        [mamba_state_indices[i] for i in rows],
+                    )
             # Advances the ownership map to the post-gather layout, so the returned
             # remap has to reach the device: dropping it would leave the map claiming
             # a move that never happened.
@@ -2761,6 +2904,8 @@ class TTModelRunner:
             block_tables=block_tables,
             block_tables_per_group=block_tables_per_group,
             block_tables_per_layer=self._block_tables_per_layer(block_tables_per_group),
+            mamba_state_indices=mamba_state_indices if is_prompt else None,
+            state_imports=state_imports,
             unpadded_batch_size=num_reqs,
             row_req_ids=row_req_ids,
             stage_inputs=stage_inputs,
@@ -4194,6 +4339,9 @@ class TTModelRunner:
         # and never see the kwarg.
         if model_input.block_tables_per_layer is not None:
             kwargs["page_tables_per_layer"] = model_input.block_tables_per_layer
+        state_indices = getattr(model_input, "mamba_state_indices", None)
+        if state_indices is not None:
+            kwargs["mamba_state_indices"] = state_indices
         kwargs.update(model_input.multi_modal_kwargs)
         if model_input.stage_inputs is not None:
             kwargs["stage_inputs"] = model_input.stage_inputs

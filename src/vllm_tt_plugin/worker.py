@@ -538,8 +538,11 @@ class TTWorker(WorkerBase):
             ensure_kv_transfer_initialized(self.vllm_config, kv_cache_config)
         self.model_runner.initialize_kv_cache(kv_cache_config)
         if kv_transfer.kv_transfer_enabled(self.vllm_config):
+            caches = self.model_runner.transfer_kv_caches
             kv_transfer.register_device_caches(
-                self.mesh_device, self.model_runner.kv_caches, kv_cache_config
+                self.mesh_device,
+                self.model_runner.kv_caches if caches is None else caches,
+                kv_cache_config,
             )
 
     def get_kv_connector_handshake_metadata(self) -> dict | None:
@@ -916,6 +919,11 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig, num_devices: int = 1) -
                 output_reservation_blocks,
             )
             num_tt_blocks = admission_floor
+    state_blocks = _state_hybrid_num_blocks(
+        vllm_config, model_class, max_tokens_all_users, max_batch
+    )
+    if state_blocks is not None:
+        num_tt_blocks = state_blocks
     if is_tt_block_output_model(vllm_config):
         resolved_kv_tokens = num_tt_blocks * cache_config.block_size
         required_kv_tokens = model_config.max_model_len + output_tokens_per_step
@@ -936,6 +944,46 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig, num_devices: int = 1) -
             )
 
     return num_tt_blocks
+
+
+def _state_hybrid_num_blocks(
+    vllm_config: VllmConfig, model_class, max_tokens_all_users: int, max_batch: int
+) -> int | None:
+    """Pool size for a model with recurrent-state (``MambaSpec``) groups, or None for
+    others.
+
+    vLLM gives attention and state layers one block pool and raises the attention block
+    size until an attention page is a state page, so the pool is counted in those larger
+    blocks: the token budget's attention blocks, one running-state block per state group
+    and request, and the null block.
+    """
+    from vllm.v1.kv_cache_interface import MambaSpec
+
+    specs = (
+        kv_cache_spec_from_model_class(model_class, vllm_config)
+        if model_class
+        else None
+    )
+    if not specs or not any(isinstance(s, MambaSpec) for s in specs.values()):
+        return None
+    _, groups = _kv_cache_groups_for_sizing(vllm_config, specs)
+    attn = [g for g in groups if not isinstance(g.kv_cache_spec, MambaSpec)]
+    state = [g for g in groups if isinstance(g.kv_cache_spec, MambaSpec)]
+    attn_block = max(g.kv_cache_spec.block_size for g in attn) if attn else 1
+    num_blocks = (
+        len(attn) * math.ceil(max_tokens_all_users / attn_block)
+        + len(state) * max_batch
+        + 1
+    )
+    logger.info(
+        "TT KV pool for a recurrent-state model: %d blocks (%d-token attention "
+        "blocks, %d state groups x %d requests, null block).",
+        num_blocks,
+        attn_block,
+        len(state),
+        max_batch,
+    )
+    return num_blocks
 
 
 def _fit_block_output_max_model_len(

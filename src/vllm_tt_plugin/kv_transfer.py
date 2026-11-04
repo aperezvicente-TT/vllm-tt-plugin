@@ -89,6 +89,10 @@ def shadow_kv_caches(kv_cache_config: KVCacheConfig) -> dict[str, torch.Tensor]:
     out: dict[str, torch.Tensor] = {}
     for group in kv_cache_config.kv_cache_groups:
         spec = group.kv_cache_spec
+        if is_state_spec(spec):
+            for name in group.layer_names:
+                out[name] = state_shadow(spec, kv_cache_config.num_blocks)
+            continue
         packed = getattr(spec, "state_content_bytes", None)
         last = packed if packed is not None else 2 * spec.head_size
         dtype = torch.uint8 if packed is not None else spec.dtype
@@ -96,6 +100,24 @@ def shadow_kv_caches(kv_cache_config: KVCacheConfig) -> dict[str, torch.Tensor]:
         for name in group.layer_names:
             out[name] = torch.empty((1,), dtype=dtype).expand(shape)
     return out
+
+
+def is_state_spec(spec) -> bool:
+    from vllm.v1.kv_cache_interface import MambaSpec
+
+    return isinstance(spec, MambaSpec)
+
+
+def state_shadow(spec, num_blocks: int) -> torch.Tensor:
+    """Storage-free tensor for a recurrent-state layer: one page (``page_size_bytes``)
+    per block.
+
+    Connectors size the state host buffer from it (4-D, like attention layers) and
+    address each state slot's conv and SSM regions from the spec, so only its bytes per
+    block matter."""
+    return torch.empty((1,), dtype=torch.uint8).expand(
+        (num_blocks, 1, 1, spec.page_size_bytes)
+    )
 
 
 # Bytes of one 32x32 tile on the device for block-float formats (shared exponents per 16

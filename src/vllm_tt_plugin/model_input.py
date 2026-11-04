@@ -185,6 +185,16 @@ class TTModelInput:
     # identity. Shape: [total_B].
     slot_remap: torch.Tensor | None = None
 
+    # Models with recurrent-state (``MambaSpec``) groups: per row, the vLLM block id of
+    # the request's state slot for each state layer, ``{model layer index: block id}``.
+    # A prefill writes the state it ends with there; a KV connector moves those slots.
+    mamba_state_indices: list[dict[int, int]] | None = None
+
+    # Decode-only: ``(device state slots, mamba_state_indices)`` of rows that joined
+    # decode with state received from a remote prefill; the model loads those slots
+    # before the forward.
+    state_imports: tuple[list[int], list[dict[int, int]]] | None = None
+
     # Prefill-only: the device state slot each prefilling row writes to. Global for
     # single-process DP (supplied by the scheduler-owned step plan), local otherwise.
     prefill_empty_slots: list[int] | None = None

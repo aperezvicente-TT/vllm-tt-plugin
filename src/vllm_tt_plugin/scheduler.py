@@ -730,8 +730,9 @@ class TTScheduler(AsyncScheduler):
         sample the next), and that token runs in the decode step with the running
         requests instead of stalling them for a prefill step. Requests that need what
         only the prefill program does (prompt logprobs, multimodal inputs, device
-        sampling or recurrent state) keep the prefill path. Must agree with the runner's
-        check in ``_prepare_model_inputs``.
+        sampling, or recurrent state the model cannot load from its received state
+        slots) keep the prefill path. Must agree with the runner's check in
+        ``_prepare_model_inputs``.
         """
         if request.status != RequestStatus.WAITING_FOR_REMOTE_KVS:
             return False
@@ -742,11 +743,16 @@ class TTScheduler(AsyncScheduler):
         ):
             return False
         return (
-            request.num_computed_tokens == request.num_tokens
+            # The whole prompt, or all but its last token (state models: the prefill
+            # node computes the state before the last token, which the decode node then
+            # runs, upstream C12).
+            request.num_computed_tokens >= request.num_tokens - 1
             and request.num_tokens > 1
             and not request.mm_features
             and kv_transfer.decode_join_sampling_ok(request.sampling_params)
-            and not self._has_recurrent_state()
+            and (
+                not self._has_recurrent_state() or self._model_imports_recurrent_state()
+            )
         )
 
     def _has_recurrent_state(self) -> bool:
@@ -756,6 +762,21 @@ class TTScheduler(AsyncScheduler):
             isinstance(g.kv_cache_spec, MambaSpec)
             for g in self.kv_cache_config.kv_cache_groups
         )
+
+    def _model_imports_recurrent_state(self) -> bool:
+        """Whether the model loads a request's received state slots into its decode
+        slot (``import_recurrent_state``), so a request with recurrent state can join
+        decode too."""
+        cached = getattr(self, "_imports_state", None)
+        if cached is None:
+            from vllm.model_executor.model_loader import get_model_architecture
+
+            try:
+                model_cls, _ = get_model_architecture(self.vllm_config.model_config)
+            except Exception:
+                model_cls = None
+            cached = self._imports_state = hasattr(model_cls, "import_recurrent_state")
+        return cached
 
     def _split_kv_holding(self) -> tuple[list[Request], list[Request]]:
         """``kv_holding_waiting`` split into (requests that join the next decode

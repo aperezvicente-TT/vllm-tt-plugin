@@ -1283,6 +1283,9 @@ class TTAsyncDecodeController:
         sampling_rows: list[int] | None = None,
     ) -> TTDecodeSubmission:
         runner = self.runner
+        state_imports = getattr(model_input, "state_imports", None)
+        if state_imports is not None:
+            runner.model.import_recurrent_state(*state_imports)
         batch_size_per_dp = model_input.unpadded_batch_size
         if not isinstance(batch_size_per_dp, list):
             batch_size_per_dp = [batch_size_per_dp]
