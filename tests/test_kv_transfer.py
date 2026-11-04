@@ -418,3 +418,68 @@ def test_handle_preemptions_reaches_the_connector(monkeypatch):
     kv_transfer.handle_preemptions(SimpleNamespace(kv_connector_metadata=None))
     kv_transfer.handle_preemptions(SimpleNamespace(kv_connector_metadata="m"))
     assert seen == ["m"]
+
+
+def test_host_buffer_layout_follows_vllm_kv_cache_layout(monkeypatch):
+    """A row-major host-buffer layout is selected with vLLM's own VLLM_KV_CACHE_LAYOUT,
+    only when a connector is configured and the copy-op provider converts to it;
+    otherwise device bytes."""
+    import vllm.envs as envs
+    from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
+
+    on = SimpleNamespace(kv_transfer_config=object())
+    off = SimpleNamespace(kv_transfer_config=None)
+    monkeypatch.setattr(kv_transfer, "_wire_layouts", ("LBHNC", "LBNHC"))
+    monkeypatch.delenv("VLLM_KV_CACHE_LAYOUT", raising=False)
+    assert envs.VLLM_KV_CACHE_LAYOUT is None
+    assert kv_transfer.host_buffer_wire_layout(on) is None
+    assert kv_transfer.supported_kv_cache_layouts(on) == ["LBNHC"]
+    for name, want in (("LBHNC", "LBHNC"), ("HND", "LBHNC"), ("LBNHC", "LBNHC")):
+        monkeypatch.setenv("VLLM_KV_CACHE_LAYOUT", name)
+        assert kv_transfer.host_buffer_wire_layout(on) == want
+        assert kv_transfer.host_buffer_wire_layout(off) is None
+        supported = kv_transfer.supported_kv_cache_layouts(on)
+        assert supported[0] == "LBNHC" and want in supported
+        # What vLLM's engine core then resolves from the worker's report.
+        cfg = SimpleNamespace(
+            cache_config=SimpleNamespace(kv_cache_layout=None), kv_transfer_config=None
+        )
+        assert resolve_kv_cache_layout(cfg, [supported]).name == want
+    # A provider without conversion keeps device bytes; vLLM itself refuses the
+    # unsupported layout.
+    monkeypatch.setattr(kv_transfer, "_wire_layouts", ())
+    monkeypatch.setenv("VLLM_KV_CACHE_LAYOUT", "LBHNC")
+    assert kv_transfer.host_buffer_wire_layout(on) is None
+    assert kv_transfer.supported_kv_cache_layouts(on) == ["LBNHC"]
+
+
+def test_wire_layout_reaches_the_provider(monkeypatch):
+    calls = []
+
+    class Conn:
+        def register_kv_caches(self, caches):
+            pass
+
+        def set_host_xfer_buffer_ops(self, op):
+            pass
+
+    import vllm.distributed.kv_transfer as kvt
+
+    monkeypatch.setattr(kvt, "has_kv_transfer_group", lambda: True)
+    monkeypatch.setattr(kvt, "get_kv_transfer_group", lambda: Conn())
+    monkeypatch.setattr(kv_transfer, "_copy_op", None)
+    spec = SimpleNamespace(
+        num_kv_heads=1, block_size=4, head_size=8, dtype=torch.bfloat16
+    )
+    cfg = SimpleNamespace(
+        num_blocks=2,
+        kv_cache_groups=[SimpleNamespace(kv_cache_spec=spec, layer_names=["l0"])],
+    )
+    monkeypatch.setattr(
+        kv_transfer,
+        "_copy_op_provider",
+        lambda m, c, cfg, **kw: calls.append(kw) or object(),
+    )
+    kv_transfer.register_device_caches(None, {}, cfg)
+    kv_transfer.register_device_caches(None, {}, cfg, wire_layout="LBHNC")
+    assert calls == [{}, {"wire_layout": "LBHNC"}]

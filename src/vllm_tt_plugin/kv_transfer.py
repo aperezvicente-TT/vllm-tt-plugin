@@ -15,6 +15,12 @@ connectors see the TT cache through three things defined here:
   device-transfer code of its own. A copy op with a `shadow_kv_caches()` method supplies
   the per-layer tensors connectors see instead of the ones below: LMCache moves blocks
   by the tensors' device and token/head axes, which only the provider knows.
+- Host-buffer layouts: by default host buffers hold the device's own (tiled) bytes,
+  which only another TT instance reads. A provider that converts while it copies
+  declares the vLLM `KVCacheLayout`s it produces (`wire_layouts`); when the user selects
+  one with vLLM's own `VLLM_KV_CACHE_LAYOUT`, the worker offers it to vLLM's layout
+  resolution and the host buffers hold KV in that row-major layout, as on any other
+  platform.
 """
 
 from __future__ import annotations
@@ -51,6 +57,7 @@ class TTAttentionBackend(AttentionBackend):
 # (mesh_device, device_caches_by_layer, kv_cache_config) -> CopyBlocksOp
 CopyOpProvider = Callable[[Any, dict[str, Any], "KVCacheConfig"], Callable]
 _copy_op_provider: CopyOpProvider | None = None
+_wire_layouts: tuple[str, ...] = ()
 _copy_op: Any = None
 # Received requests whose host -> device copy is still running: (request ids, load
 # ticket).
@@ -59,13 +66,46 @@ _held_recvs: list[tuple[set[str], int]] = []
 _unwaited_saves: set[str] = set()
 
 
-def register_copy_op_provider(provider: CopyOpProvider) -> None:
-    global _copy_op_provider
+def register_copy_op_provider(
+    provider: CopyOpProvider, wire_layouts: tuple[str, ...] = ()
+) -> None:
+    """`wire_layouts`: vLLM KVCacheLayout names the provider's copy op can hold host
+    buffers in (it is then called with `wire_layout=<name>`); empty for device bytes
+    only."""
+    global _copy_op_provider, _wire_layouts
     _copy_op_provider = provider
+    _wire_layouts = tuple(wire_layouts)
 
 
 def kv_transfer_enabled(vllm_config: VllmConfig) -> bool:
     return getattr(vllm_config, "kv_transfer_config", None) is not None
+
+
+# The layout every TT cache setup supports; host buffers then hold device bytes.
+DEFAULT_KV_CACHE_LAYOUT = "LBNHC"
+_LAYOUT_ALIASES = {"NHD": "LBNHC", "HND": "LBHNC"}
+
+
+def host_buffer_wire_layout(vllm_config: VllmConfig) -> str | None:
+    """The row-major layout host buffers hold: the one the user selected with
+    `VLLM_KV_CACHE_LAYOUT`, when a connector is configured and the copy-op provider
+    produces it. None: device bytes (also when the selected layout is unsupported;
+    vLLM's layout resolution then refuses it)."""
+    import vllm.envs as envs
+
+    name = envs.VLLM_KV_CACHE_LAYOUT
+    if name is None or not kv_transfer_enabled(vllm_config):
+        return None
+    name = _LAYOUT_ALIASES.get(name, name)
+    return name if name in _wire_layouts else None
+
+
+def supported_kv_cache_layouts(vllm_config: VllmConfig) -> list[str]:
+    """What the TT worker reports to vLLM's layout resolution, most preferred first."""
+    wire = host_buffer_wire_layout(vllm_config)
+    if wire is None or wire == DEFAULT_KV_CACHE_LAYOUT:
+        return [DEFAULT_KV_CACHE_LAYOUT]
+    return [DEFAULT_KV_CACHE_LAYOUT, wire]
 
 
 def layer_names(vllm_config: VllmConfig) -> list[str]:
@@ -182,9 +222,11 @@ def register_device_caches(
     mesh_device: Any,
     device_caches: dict[str, Any],
     kv_cache_config: KVCacheConfig,
+    wire_layout: str | None = None,
 ) -> None:
     """Hand the connector the shadow caches and, for host-buffer connectors, the copy
-    op."""
+    op. `wire_layout`: `host_buffer_wire_layout()`; the copy op then fills host buffers
+    in it."""
     from vllm.distributed.kv_transfer import (
         get_kv_transfer_group,
         has_kv_transfer_group,
@@ -202,7 +244,12 @@ def register_device_caches(
     # registering caches, and the copy op's layout is part of it (see
     # kv_transfer_compat_factors).
     global _copy_op
-    _copy_op = _copy_op_provider(mesh_device, device_caches, kv_cache_config)
+    if wire_layout is not None:
+        _copy_op = _copy_op_provider(
+            mesh_device, device_caches, kv_cache_config, wire_layout=wire_layout
+        )
+    else:
+        _copy_op = _copy_op_provider(mesh_device, device_caches, kv_cache_config)
     own = getattr(_copy_op, "shadow_kv_caches", None)
     connector.register_kv_caches(
         own() if own is not None else shadow_kv_caches(kv_cache_config)

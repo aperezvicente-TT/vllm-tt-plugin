@@ -370,7 +370,11 @@ class TTWorker(WorkerBase):
     def get_supported_kv_cache_layouts(self) -> list[str]:
         # TT cache setup handles only LBNHC's per-group packing; it is also
         # block-compact, so models with mixed KV shapes still resolve to it.
-        return [KVCacheLayout.LBNHC.name]
+        # A row-major host-buffer layout the user selects with VLLM_KV_CACHE_LAYOUT
+        # follows it when the copy op converts to it (kv_transfer).
+        return kv_transfer.supported_kv_cache_layouts(
+            getattr(self, "vllm_config", None)
+        )
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         """
@@ -543,6 +547,7 @@ class TTWorker(WorkerBase):
                 self.mesh_device,
                 self.model_runner.kv_caches if caches is None else caches,
                 kv_cache_config,
+                wire_layout=kv_transfer.host_buffer_wire_layout(self.vllm_config),
             )
 
     def get_kv_connector_handshake_metadata(self) -> dict | None:
@@ -725,10 +730,11 @@ def _kv_cache_groups_for_sizing(vllm_config: VllmConfig, kv_cache_specs: dict):
 
     vLLM 0.29+ packs heterogeneous groups by the KV cache layout, which the
     engine core resolves only after ``init_device`` (``resolve_kv_cache_layout``),
-    so the real ``cache_config`` still has no layout here. TT advertises LBNHC
-    alone (``TTWorker.get_supported_kv_cache_layouts``), so that is what the
-    engine resolves; size against it on a shallow copy, leaving the shared
-    config for the engine to resolve itself.
+    so the real ``cache_config`` still has no layout here. TT advertises LBNHC,
+    plus the host-buffer layout ``VLLM_KV_CACHE_LAYOUT`` selects
+    (``TTWorker.get_supported_kv_cache_layouts``), and the engine resolves to
+    the selected one when there is one; size against that on a shallow copy,
+    leaving the shared config for the engine to resolve itself.
     """
     cache_config = vllm_config.cache_config
     if getattr(cache_config, "kv_cache_layout", None) is not None or not hasattr(
@@ -737,7 +743,9 @@ def _kv_cache_groups_for_sizing(vllm_config: VllmConfig, kv_cache_specs: dict):
         return vllm_config, get_kv_cache_groups(vllm_config, kv_cache_specs)
     sizing_config = copy.copy(vllm_config)
     sizing_config.cache_config = copy.copy(cache_config)
-    sizing_config.cache_config.kv_cache_layout = KVCacheLayout.LBNHC.name
+    sizing_config.cache_config.kv_cache_layout = (
+        kv_transfer.host_buffer_wire_layout(vllm_config) or KVCacheLayout.LBNHC.name
+    )
     return sizing_config, get_kv_cache_groups(sizing_config, kv_cache_specs)
 
 
