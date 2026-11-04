@@ -28,6 +28,27 @@ def test_merge_keeps_first_pass_receives():
     assert out.scheduler_clock == 2.0  # scalars from the second pass
 
 
+def test_merge_multi_connector_children():
+    """MultiConnector metadata: each connector's first-pass work survives the second
+    pass."""
+    from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
+        MultiKVConnectorMetadata,
+    )
+
+    first = MultiKVConnectorMetadata(
+        metadata=(Meta(reqs_to_recv={"a": 1}), Meta(reqs_to_save={"x": 1})),
+        extra_async_saves={"a": 1},
+    )
+    second = MultiKVConnectorMetadata(
+        metadata=(Meta(reqs_to_save={"b": 2}), Meta(reqs_to_save={"y": 2})),
+    )
+    out = _merge_connector_metadata(first, second)
+    nixl, lmc = out.metadata
+    assert nixl.reqs_to_recv == {"a": 1} and nixl.reqs_to_save == {"b": 2}
+    assert lmc.reqs_to_save == {"x": 1, "y": 2}
+    assert out.extra_async_saves == {"a": 1}
+
+
 def test_merge_none():
     m = Meta()
     assert _merge_connector_metadata(None, m) is m

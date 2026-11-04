@@ -1419,6 +1419,8 @@ def _merge_connector_metadata(first, second):
     Connector metadata is a bag of per-request dicts and sets (NixlConnectorMetadata:
     reqs_to_recv, reqs_to_save, reqs_in_batch, ...). Containers are merged with the
     second pass winning on key conflicts; scalars come from the second pass.
+    MultiConnector's metadata holds one child per connector (a tuple); children are
+    merged pairwise.
     """
     if first is None or second is None:
         return second if first is None else first
@@ -1429,12 +1431,23 @@ def _merge_connector_metadata(first, second):
         )
     for name, a in vars(first).items():
         b = getattr(second, name, None)
-        if isinstance(a, dict) and isinstance(b, dict):
+        if name == "metadata" and isinstance(a, tuple) and isinstance(b, tuple):
+            if len(a) != len(b):
+                raise ValueError(
+                    f"cannot merge connector metadata of {len(a)} and {len(b)} "
+                    "connectors"
+                )
+            setattr(second, name, tuple(map(_merge_connector_metadata, a, b)))
+        elif isinstance(a, dict) and isinstance(b, dict):
             setattr(second, name, {**a, **b})
         elif isinstance(a, set) and isinstance(b, set):
             setattr(second, name, a | b)
         elif isinstance(a, list) and isinstance(b, list):
             setattr(second, name, a + b)
+        elif b is None and isinstance(a, (dict, set, list)):
+            # Optional containers (MultiConnector's extra_async_saves) set by the first
+            # pass only.
+            setattr(second, name, a)
     return second
 
 
