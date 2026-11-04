@@ -120,6 +120,7 @@ def _fake_runner(
         supports_stage_inputs=False,
         model_config=SimpleNamespace(is_multimodal_model=False),
         check_perform_device_sampling=lambda **_: False,
+        check_host_candidate_sampling=lambda rows: False,
         _block_tables_per_layer=lambda _: None,
         _alloc_prefill_state_slots=lambda row_req_ids: list(range(len(row_req_ids))),
         _decode_state_slot_remap=lambda row_req_ids: None,

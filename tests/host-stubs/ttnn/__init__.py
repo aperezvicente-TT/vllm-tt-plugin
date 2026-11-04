@@ -71,6 +71,13 @@ class MeshDevice:
     """Annotation target only (``TTModelRunner.__init__``); never instantiated."""
 
 
+class DataType(Enum):
+    BFLOAT16 = "bfloat16"
+
+
+bfloat16 = DataType.BFLOAT16
+
+
 class ClusterType(Enum):
     INVALID = "invalid"
     N150 = "n150"

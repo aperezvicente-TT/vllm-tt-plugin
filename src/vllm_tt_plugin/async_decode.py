@@ -15,7 +15,7 @@ from vllm.v1.outputs import AsyncModelRunnerOutput, LogprobsLists, ModelRunnerOu
 
 from vllm_tt_plugin.input_batch import SEED_NONE_SENTINEL
 from vllm_tt_plugin.logger import init_tt_logger
-from vllm_tt_plugin.model_input import TTCompactedHostLogits
+from vllm_tt_plugin.model_input import TTCompactedHostLogits, TTHostCandidates
 from vllm_tt_plugin.scheduler import get_tt_forced_reset_discard_counts
 from vllm_tt_plugin.spec_decode import (
     ACCEPT_MODE_ARGMAX_IDS,
@@ -113,13 +113,14 @@ class TTDecodeSubmission:
     # way it plans the step after a verify, and the step is registered as not
     # overlap-safe so the next build drains it before it reloads.
     host_answered: bool = False
+    host_candidate_sampling: bool = False
 
 
 @dataclass(frozen=True)
 class TTFinalizedDecode:
     """Normalized decode result after TT event waits and host processing."""
 
-    tt_out: torch.Tensor | TTCompactedHostLogits
+    tt_out: torch.Tensor | TTCompactedHostLogits | TTHostCandidates
     tt_log_probs: torch.Tensor | None
 
 
@@ -1291,10 +1292,14 @@ class TTAsyncDecodeController:
         deferred_device_sampling = bool(
             getattr(model_input, "defer_device_sampling", False)
         )
+        host_candidate_sampling = bool(
+            getattr(model_input, "host_candidate_sampling", False)
+        )
         readback_rows = None
         if (
             sampling_rows is not None
             and not perform_device_sampling
+            and not host_candidate_sampling
             and getattr(runner.model, "model_capabilities", {}).get(
                 "supports_selective_host_readback", False
             )
@@ -1358,6 +1363,9 @@ class TTAsyncDecodeController:
             kwargs["spec_mode"] = model_input.spec_mode
         if model_input.accepted_counts is not None:
             kwargs["accepted_counts"] = model_input.accepted_counts
+        if host_candidate_sampling:
+            kwargs["host_candidates"] = True
+            kwargs["candidate_temperature"] = sampling_params.temperature
         if perform_device_sampling:
             sampling_param_dict = {
                 field.name: (
@@ -1549,6 +1557,7 @@ class TTAsyncDecodeController:
             readback_rows=readback_rows,
             stage_outputs=stage_outputs,
             host_answered=host_answered,
+            host_candidate_sampling=host_candidate_sampling,
         )
 
     def complete_deferred_device_sampling(
@@ -1650,6 +1659,17 @@ class TTAsyncDecodeController:
             tt_out = submission.tt_out
         else:
             tt_out = submission.tt_out
+
+        if submission.host_candidate_sampling:
+            if not _is_host_decode_output(tt_out):
+                tt_out = runner.model.process_decode_output_host(
+                    tt_out, is_tokens=False
+                )
+            values, indices, lse = tt_out
+            return TTFinalizedDecode(
+                tt_out=TTHostCandidates(values=values, indices=indices, lse=lse),
+                tt_log_probs=None,
+            )
 
         is_host_output = _is_host_decode_output(tt_out)
         compact_rows = None

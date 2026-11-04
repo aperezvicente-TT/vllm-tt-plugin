@@ -33,6 +33,7 @@ from vllm.v1.outputs import (
 from vllm.v1.sample.logits_processor import LogitsProcessors, build_logitsprocs
 from vllm.v1.sample.metadata import SamplingMetadata
 
+from vllm_tt_plugin import kv_transfer
 from vllm_tt_plugin.async_decode import (
     AsyncTTModelRunnerOutput,
     CompletedDecodeStep,
@@ -55,7 +56,12 @@ from vllm_tt_plugin.config import (
     is_tt_block_output_model,
     is_tt_device_grammar_preload_eligible,
 )
-from vllm_tt_plugin.host_sampler import create_host_sampler
+from vllm_tt_plugin.host_sampler import (
+    create_host_sampler,
+    fast_apply_top_k_top_p,
+    sample_from_candidates,
+    sample_unseeded,
+)
 from vllm_tt_plugin.input_batch import (
     SEED_NONE_SENTINEL,
     InputBatch,
@@ -71,6 +77,7 @@ from vllm_tt_plugin.loader import TTModelLoader
 from vllm_tt_plugin.logger import init_tt_logger
 from vllm_tt_plugin.logprobs import build_device_logprobs
 from vllm_tt_plugin.model_input import (
+    TTHostCandidates,
     TTModelInput,
     TTSamplingParams,
     live_row_index,
@@ -486,6 +493,8 @@ class TTModelRunner:
         # Every standard-DP rank owns its own mesh and therefore its own host
         # sampler state. Single-process modes also instantiate exactly one.
         self.host_sampler = create_host_sampler()
+        # Rows of host-candidate decode steps that had to read the full logits.
+        self.host_candidate_fallback_rows = 0
 
         # Host-side logits processors (min_p, logit_bias, min_tokens, plus any
         # custom logits processors). Used by the host sampler when device
@@ -793,9 +802,12 @@ class TTModelRunner:
             self.parallel_config, "attention"
         )
         per_layer_specs = self._build_per_layer_specs(kv_cache_config, num_layers)
+        dtype_kwargs = self._engine_kv_cache_dtype_kwargs()
 
         if hasattr(self.model, "allocate_kv_cache_per_layer"):
-            return self.model.allocate_kv_cache_per_layer(per_layer_specs)
+            return self.model.allocate_kv_cache_per_layer(
+                per_layer_specs, **dtype_kwargs
+            )
 
         # Legacy ``allocate_kv_cache(shape, dtype, num_layers)`` API: every
         # layer must have the same shape/dtype. The third tuple element is
@@ -809,7 +821,23 @@ class TTModelRunner:
                     "allocate_kv_cache; hybrid attention models must "
                     "override allocate_kv_cache_per_layer."
                 )
-        return self.model.allocate_kv_cache(shape, dtype, len(per_layer_specs))
+        return self.model.allocate_kv_cache(
+            shape, dtype, len(per_layer_specs), **dtype_kwargs
+        )
+
+    def _engine_kv_cache_dtype_kwargs(self) -> dict:
+        """``--kv-cache-dtype`` as the model allocator's ``kv_cache_dtype``.
+
+        "auto" keeps the model's own precision profile. An explicit dtype must reach the
+        device cache: connectors size host buffers from it.
+        """
+        cache_dtype = self.cache_config.cache_dtype
+        if cache_dtype == "auto":
+            return {}
+        ttnn_dtypes = {"bfloat16": ttnn.bfloat16}
+        if cache_dtype not in ttnn_dtypes:
+            raise ValueError(f"--kv-cache-dtype {cache_dtype} is not supported on TT")
+        return {"kv_cache_dtype": ttnn_dtypes[cache_dtype]}
 
     def _block_tables_per_layer(
         self, block_tables_per_group: list[torch.Tensor]
@@ -2349,8 +2377,27 @@ class TTModelRunner:
             for req_id in cached_reqs.req_ids
             if req_id not in cached_reqs.resumed_req_ids
         )
+
+        # A new request with all but its last prompt token already computed (its KV came
+        # from a remote prefill) joins decode: its last prompt token is the decode input
+        # at position num_tokens - 1, like any running request's latest token. The
+        # scheduler only puts such requests into decode steps
+        # (TTScheduler._joins_decode).
+        def _joins_decode(new_req) -> bool:
+            n = len(new_req.prompt_token_ids or ())
+            return (
+                n > 1
+                and new_req.num_computed_tokens == n - 1
+                and num_scheduled[new_req.req_id] == 1
+                and not new_req.mm_features
+                and kv_transfer.decode_join_sampling_ok(new_req.sampling_params)
+            )
+
+        joining = {
+            r.req_id for r in scheduler_output.scheduled_new_reqs if _joins_decode(r)
+        }
         is_prompt = (
-            len(scheduler_output.scheduled_new_reqs) > 0
+            len(scheduler_output.scheduled_new_reqs) > len(joining)
             or bool(cached_reqs.resumed_req_ids)
             or has_chunked_continuation
         )
@@ -2581,6 +2628,14 @@ class TTModelRunner:
         defer_device_sampling = (
             perform_device_sampling and has_scheduled_structured and not is_prompt
         )
+        host_candidate_sampling = (
+            not perform_device_sampling
+            and not is_prompt
+            and not has_structured
+            and not self._num_speculative_tokens
+            and self.tt_data_parallel_size == 1
+            and self.check_host_candidate_sampling(req_indices)
+        )
 
         # Populate prompt_tokens and output_tokens if penalties are needed
         # (decode only). Bad words need output_tokens too: vLLM's bad-words op
@@ -2674,6 +2729,13 @@ class TTModelRunner:
         if is_prompt:
             prefill_empty_slots = self._alloc_prefill_state_slots(row_req_ids)
         else:
+            # A request that joined decode without a prefill (see ``_joins_decode``
+            # above) has no slot yet; it needs no slot state, so it takes a free slot
+            # here.
+            if joining:
+                self._alloc_prefill_state_slots(
+                    [r for r in row_req_ids if r in joining]
+                )
             # Advances the ownership map to the post-gather layout, so the returned
             # remap has to reach the device: dropping it would leave the map claiming
             # a move that never happened.
@@ -2711,6 +2773,7 @@ class TTModelRunner:
             prefill_empty_slots=prefill_empty_slots,
             intermediate_prefill_mask=intermediate_prefill_mask,
             defer_device_sampling=defer_device_sampling,
+            host_candidate_sampling=host_candidate_sampling,
             structured_output_req_ids=structured_output_req_ids,
             grammar_row_req_ids=tuple(row_req_ids)
             + (None,) * (input_tokens.shape[0] - len(row_req_ids)),
@@ -3091,6 +3154,60 @@ class TTModelRunner:
 
     @torch.no_grad()
     def execute_model(
+        self,
+        scheduler_output: SchedulerOutput,
+    ) -> ModelRunnerOutput | None:
+        from vllm.distributed.kv_transfer import has_kv_transfer_group
+
+        if has_kv_transfer_group() and not getattr(self, "_in_kv_step", False):
+            return TTModelRunner._execute_model_with_kv_connector(
+                self, scheduler_output
+            )
+        return TTModelRunner._execute_model_body(self, scheduler_output)
+
+    def _execute_model_with_kv_connector(
+        self, scheduler_output: SchedulerOutput
+    ) -> ModelRunnerOutput | None:
+        """Upstream KV connector lifecycle around one step
+        (KVConnectorModelRunnerMixin).
+
+        Loads start and finished transfers are collected every step, including steps
+        with no tokens: that is when a decode node waits for its remote KV. Saves
+        (device -> host) run after the forward is enqueued, so they are ordered after it
+        on the device queue.
+        """
+        from vllm.forward_context import set_forward_context
+        from vllm.v1.worker.kv_connector_model_runner_mixin import (
+            KVConnectorModelRunnerMixin,
+        )
+
+        if get_tt_step_plan(scheduler_output) is not None:
+            raise NotImplementedError(
+                "KV connectors are not supported with TT lane data parallelism"
+            )
+        with (
+            set_forward_context(None, self.vllm_config),
+            KVConnectorModelRunnerMixin._get_kv_connector_output(
+                scheduler_output
+            ) as kv_output,
+        ):
+            self._in_kv_step = True
+            try:
+                ret = TTModelRunner._execute_model_body(self, scheduler_output)
+            finally:
+                self._in_kv_step = False
+        kv_transfer.gate_received(kv_output)
+        if ret is EMPTY_MODEL_RUNNER_OUTPUT:
+            kv_transfer.wait_saves()
+            return ModelRunnerOutput.with_kv_conn_output_only(kv_output)
+        if ret is None and self._pending_samples:
+            finish = self._pending_samples.pop()
+            self._pending_samples.append(
+                partial(_finish_with_kv_output, finish, kv_output)
+            )
+        return ret
+
+    def _execute_model_body(
         self,
         scheduler_output: SchedulerOutput,
     ) -> ModelRunnerOutput | None:
@@ -3984,6 +4101,48 @@ class TTModelRunner:
 
         return True
 
+    def check_host_candidate_sampling(self, sampling_rows: list[int]) -> bool:
+        """Whether a host-sampled decode step can sample from the model's top-K
+        candidates.
+
+        Every row must be unseeded random sampling whose top-k/top-p cut usually
+        lies within the top K: ``top_k <= K``, or top-p without top-k. Other rows
+        need values past the top K every step: plain temperature sampling, and a
+        top-k wider than K, whose top-p renormalises over the whole top-k set.
+        Anything that reads or edits the full logits on the host (penalties,
+        min_p, logit bias, min_tokens, bad words, allowed token ids, custom
+        logits processors, logprobs) keeps the full-logits path. Rows the
+        candidates cannot decide in a given step read that step's full logits
+        (``_sample_host_candidates``).
+        """
+        capabilities = getattr(self.model, "model_capabilities", None) or {}
+        capability = capabilities.get("host_candidate_sampling")
+        if not capability or not sampling_rows:
+            return False
+        input_batch = self.input_batch
+        sampling = input_batch.sampling
+        if (
+            not input_batch.no_penalties
+            or not input_batch.no_allowed_token_ids
+            or sampling.bad_words_token_ids
+            or sampling.has_active_logitsprocs()
+            or self.model_config.logits_processors
+            or input_batch.max_num_logprobs is not None
+        ):
+            return False
+        rows = list(sampling_rows)
+        if any(row in sampling.generators for row in rows) or bool(
+            (sampling.seed[rows] != SEED_NONE_SENTINEL).any()
+        ):
+            return False
+        if not bool((sampling.temperature[rows] > 0).all()):
+            return False
+        top_k = sampling.top_k[rows]
+        cut_inside = (top_k <= int(capability["k"])) | (
+            (top_k >= self.vocab_size) & (sampling.top_p[rows] < 1.0)
+        )
+        return bool(cut_inside.all())
+
     def submit_prefill(
         self,
         model_input: TTModelInput,
@@ -4224,6 +4383,11 @@ class TTModelRunner:
                 )
                 next_token_ids = torch.zeros(sz, dtype=torch.int32)
                 logprobs_per_dp.append(None)
+            elif isinstance(tt_out, TTHostCandidates):
+                next_token_ids = self._sample_host_candidates(
+                    tt_out, rows, sampling_params
+                )
+                logprobs_per_dp.append(None)
             elif not perform_device_sampling:
                 self._check_host_logits(
                     tt_out,
@@ -4400,6 +4564,46 @@ class TTModelRunner:
                 start += sz
 
         return sampled_token_ids_per_dp, logprobs_per_dp
+
+    def _sample_host_candidates(
+        self,
+        candidates: TTHostCandidates,
+        rows: torch.Tensor,
+        sampling_params: TTSamplingParams,
+    ) -> torch.Tensor:
+        """Sample ``rows`` from their top-K candidates.
+
+        Temperature is applied here, as the host sampler does; the model applied
+        the same temperatures to ``lse``. Rows the candidates cannot decide read
+        the step's full logits from the device (about 8 MB at a 128K vocabulary).
+        At T <= 1 the top 256 tokens nearly always hold p of the mass, so this is
+        rare.
+        """
+        assert isinstance(sampling_params.temperature, torch.Tensor)
+        assert isinstance(sampling_params.top_k, torch.Tensor)
+        assert isinstance(sampling_params.top_p, torch.Tensor)
+        temperature = sampling_params.temperature[rows].to(torch.float32).unsqueeze(1)
+        top_k = sampling_params.top_k[rows]
+        top_p = sampling_params.top_p[rows]
+        values = candidates.values[rows].to(torch.float32) / temperature
+        tokens, exact = sample_from_candidates(
+            values,
+            candidates.indices[rows],
+            candidates.lse[rows],
+            top_k,
+            top_p,
+            self.vocab_size,
+        )
+        if not bool(exact.all()):
+            missing = (~exact).nonzero().view(-1)
+            self.host_candidate_fallback_rows += len(missing)
+            logits = self.model.read_decode_candidate_logits()[rows[missing]]
+            logits = logits.to(torch.float32) / temperature[missing]
+            logits = fast_apply_top_k_top_p(logits, top_k[missing], top_p[missing])
+            tokens[missing] = sample_unseeded(
+                logits.softmax(dim=-1, dtype=torch.float32)
+            )
+        return tokens.to(torch.int32).view(-1, 1)
 
     def _check_host_logits(
         self,
@@ -4785,3 +4989,28 @@ class TTModelRunner:
             self.model.warmup_model_prefill(enable_trace=True, **prefill_kwargs)
         if trace_decode_mode:
             self.model.warmup_model_decode(enable_trace=True, **decode_kwargs)
+
+
+def _finish_with_kv_output(finish, kv_output, grammar_output):
+    """Attach a step's KV connector output to the runner output its sampler produces.
+
+    The step's KV saves were enqueued after its forward; they overlap sampling and are
+    awaited here, before the output can finish a request.
+    """
+    out = finish(grammar_output)
+    kv_transfer.wait_saves()
+    kv_transfer.release_ready(kv_output)
+    if out is None:
+        return out
+    if isinstance(out, ModelRunnerOutput):
+        out.kv_connector_output = kv_output
+        return out
+    get_output = out.get_output
+
+    def get_output_with_kv():
+        o = get_output()
+        o.kv_connector_output = kv_output
+        return o
+
+    out.get_output = get_output_with_kv
+    return out

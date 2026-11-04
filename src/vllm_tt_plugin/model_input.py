@@ -28,6 +28,20 @@ class TTCompactedHostLogits:
 
 
 @dataclass(frozen=True)
+class TTHostCandidates:
+    """A host-candidate decode's output, in decode-slot row order.
+
+    ``values`` [B, K]: each row's top-K raw logits, sorted descending.
+    ``indices`` [B, K]: their vocabulary ids.
+    ``lse`` [B]: the logsumexp over the vocabulary of logits / T.
+    """
+
+    values: torch.Tensor
+    indices: torch.Tensor
+    lse: torch.Tensor
+
+
+@dataclass(frozen=True)
 class TTDecodeReloadPlan:
     """Explicit host-to-device updates for one decode submission.
 
@@ -222,6 +236,11 @@ class TTModelInput:
     # ``stage_inputs``. ``None`` unless the model declares
     # ``supports_stage_inputs``.
     stage_inputs: list[Any] | None = None
+
+    # Decode-only: the model returns per-row top-K candidates and the row
+    # logsumexp instead of logits (``TTHostCandidates``); the host samples from
+    # those. See ``TTModelRunner.check_host_candidate_sampling``.
+    host_candidate_sampling: bool = False
 
     # Decode-only: retain device logits until sample_tokens supplies the grammar,
     # then invoke the model's device sampler. Structured prefills stay on host.
