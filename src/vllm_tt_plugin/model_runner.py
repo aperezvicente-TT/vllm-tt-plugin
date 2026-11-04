@@ -3198,6 +3198,7 @@ class TTModelRunner:
             raise NotImplementedError(
                 "KV connectors are not supported with TT lane data parallelism"
             )
+        kv_transfer.handle_preemptions(scheduler_output)
         kv_transfer.wait_saves_of_freed(scheduler_output)
         with (
             set_forward_context(None, self.vllm_config),

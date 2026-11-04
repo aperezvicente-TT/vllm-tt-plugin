@@ -304,6 +304,11 @@ def test_runner_waits_only_for_the_step_that_completes_a_prompt(monkeypatch):
         return None
 
     monkeypatch.setattr(
+        kv_transfer,
+        "handle_preemptions",
+        lambda out: events.append(("preempt", op.issued)),
+    )
+    monkeypatch.setattr(
         KVConnectorModelRunnerMixin, "_get_kv_connector_output", staticmethod(lifecycle)
     )
     monkeypatch.setattr(
@@ -324,10 +329,13 @@ def test_runner_waits_only_for_the_step_that_completes_a_prompt(monkeypatch):
         assert TTModelRunner._execute_model_with_kv_connector(runner, out) is None
         runner._pending_samples.popleft()(None)
     assert events == [
+        ("preempt", 0),
         ("forward", 0),
         ("save", 1),
+        ("preempt", 1),
         ("forward", 1),
         ("save", 2),
+        ("preempt", 2),
         ("forward", 2),
         ("save", 3),
     ]
@@ -374,3 +382,18 @@ def test_copy_op_supplies_connector_caches(monkeypatch):
         4,
         16,
     )  # the plugin's own, without the method
+
+
+def test_handle_preemptions_reaches_the_connector(monkeypatch):
+    import vllm.distributed.kv_transfer as kvt
+
+    seen = []
+    conn = SimpleNamespace(handle_preemptions=seen.append)
+    monkeypatch.setattr(kvt, "get_kv_transfer_group", lambda: conn)
+    monkeypatch.setattr(kvt, "has_kv_transfer_group", lambda: False)
+    kv_transfer.handle_preemptions(SimpleNamespace(kv_connector_metadata="m"))
+    assert seen == []
+    monkeypatch.setattr(kvt, "has_kv_transfer_group", lambda: True)
+    kv_transfer.handle_preemptions(SimpleNamespace(kv_connector_metadata=None))
+    kv_transfer.handle_preemptions(SimpleNamespace(kv_connector_metadata="m"))
+    assert seen == ["m"]

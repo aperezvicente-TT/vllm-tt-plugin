@@ -254,6 +254,20 @@ def defer_saves(scheduler_output) -> None:
     _unwaited_saves.update(r for r, _, _ in _scheduled_progress(scheduler_output))
 
 
+def handle_preemptions(scheduler_output) -> None:
+    """Before the step's forward, as vLLM's GPU runner does: a connector with
+    asynchronous saves (LMCache's async store) finishes reading the blocks of preempted
+    requests, which this step may overwrite."""
+    from vllm.distributed.kv_transfer import (
+        get_kv_transfer_group,
+        has_kv_transfer_group,
+    )
+
+    meta = getattr(scheduler_output, "kv_connector_metadata", None)
+    if meta is not None and has_kv_transfer_group():
+        get_kv_transfer_group().handle_preemptions(meta)
+
+
 def wait_saves_of_freed(scheduler_output) -> None:
     """Before a step's loads and forward, wait for running saves of requests whose
     blocks were freed since the last step (finished early, aborted or preempted).
