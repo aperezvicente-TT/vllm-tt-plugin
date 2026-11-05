@@ -385,6 +385,16 @@ def wait_saves_of_freed(scheduler_output) -> None:
         wait_saves()
 
 
+def begin_step() -> None:
+    """Before a step's forward is enqueued: the copy op may order the step's loads after
+    the work enqueued so far rather than after this forward, which never touches blocks
+    still being received (tt-kv spec 05 §3.2). Optional protocol, like the functions
+    below."""
+    op = _copy_op
+    if op is not None and hasattr(op, "begin_step"):
+        op.begin_step()
+
+
 def gate_received(kv_output) -> None:
     """Report a received request only once its host -> device copy has completed.
 
