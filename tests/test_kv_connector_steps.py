@@ -190,6 +190,17 @@ def test_join_eligibility():
     assert not scheduler._joins_decode(ok)
 
 
+def test_a_replay_window_keeps_received_requests_on_the_prefill_path():
+    """vLLM rewinds a received request by the replay window of its SWA groups, so
+    it resumes with more than one token left."""
+    scheduler = _scheduler_with_running_decode()
+    received = _received(scheduler, "B")
+    scheduler.prefix_replay_tokens = 8
+
+    assert not scheduler._joins_decode(received)
+    assert scheduler._has_pending_prefill()
+
+
 def test_recurrent_state_joins_only_when_the_model_imports_it(monkeypatch):
     scheduler = _scheduler_with_running_decode()
     received = _received(scheduler, "B", computed=1)

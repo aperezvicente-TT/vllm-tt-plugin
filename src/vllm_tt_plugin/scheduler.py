@@ -742,6 +742,11 @@ class TTScheduler(AsyncScheduler):
             or rid in self.failed_recving_kv_req_ids
         ):
             return False
+        # A KV cache group with a prefix replay window (vLLM's SWA bounded replay)
+        # rewinds a received request by the whole window on promotion, so it resumes
+        # with more than one prompt token left.
+        if self.prefix_replay_tokens:
+            return False
         return (
             # The whole prompt, or all but its last token (state models: the prefill
             # node computes the state before the last token, which the decode node then
