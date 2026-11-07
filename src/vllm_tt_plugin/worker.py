@@ -337,9 +337,22 @@ class TTWorker(WorkerBase):
         # The count is cached rather than recomputed later because
         # get_max_tokens_all_users derives the budget from max_model_len,
         # which the fit below may have shrunk.
-        self._num_tt_blocks = get_num_available_blocks_tt(
-            self.vllm_config, self.num_devices
-        )
+        num_blocks = get_num_available_blocks_tt(self.vllm_config, self.num_devices)
+        # --num-gpu-blocks-override asks for a smaller pool (determine_available_memory
+        # overwrites the field with the count used, so read it before then). The
+        # model budget is the device's ceiling: a larger request is capped.
+        requested = self.vllm_config.cache_config.num_gpu_blocks_override
+        if requested is not None:
+            if requested > num_blocks:
+                logger.warning(
+                    "--num-gpu-blocks-override %d exceeds the TT KV pool of %d "
+                    "blocks the model budgets; using %d.",
+                    requested,
+                    num_blocks,
+                    num_blocks,
+                )
+            num_blocks = min(requested, num_blocks)
+        self._num_tt_blocks = num_blocks
         _fit_block_output_max_model_len(self.vllm_config, self._num_tt_blocks)
 
     def _create_model_runner(self) -> TTModelRunner:

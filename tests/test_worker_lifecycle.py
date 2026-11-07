@@ -210,3 +210,19 @@ def test_a_worker_without_token_kv_refuses_an_ar_runner(monkeypatch):
         worker_instance.initialize_from_config(_engine_kv_cache_config(worker_instance))
 
     worker_instance.shutdown()
+
+
+@pytest.mark.parametrize(
+    "requested, used",
+    [(NUM_TT_BLOCKS - 2, NUM_TT_BLOCKS - 2), (NUM_TT_BLOCKS + 8, NUM_TT_BLOCKS)],
+)
+def test_num_gpu_blocks_override_sizes_the_pool_up_to_the_model_budget(
+    monkeypatch, requested, used
+):
+    worker_instance, _ = _worker(monkeypatch, _ARWorker)
+    worker_instance.cache_config.num_gpu_blocks_override = requested
+
+    _, kv_cache_config = _run_lifecycle(worker_instance)
+
+    assert worker_instance.cache_config.num_gpu_blocks_override == used
+    assert kv_cache_config.num_blocks == used

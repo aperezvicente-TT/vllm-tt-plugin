@@ -413,7 +413,9 @@ class TestDPModes:
 
         worker_instance = worker_cls.__new__(worker_cls)
         worker_instance.vllm_config = SimpleNamespace(
-            additional_config={}, parallel_config=parallel_config
+            additional_config={},
+            parallel_config=parallel_config,
+            cache_config=SimpleNamespace(num_gpu_blocks_override=None),
         )
         # WorkerBase aliases the field; keep the test's view identical.
         worker_instance.parallel_config = parallel_config
