@@ -1751,6 +1751,13 @@ class TTPlatform(Platform):
         return {"tt": ("cpu",)}
 
     @classmethod
+    def alloc_kv_host_buffers(cls, shapes):
+        # Upstream hook (proposed): the NIXL connector's host transfer buffers.
+        from vllm_tt_plugin import host_buffers
+
+        return host_buffers.alloc_kv_host_buffers(shapes)
+
+    @classmethod
     def get_kv_transfer_compat_factors(cls) -> dict[str, str]:
         # Proposed upstream hook: KV connectors add these to their P/D compatibility
         # hash, so P and D refuse to pair when their device cache layouts differ.
