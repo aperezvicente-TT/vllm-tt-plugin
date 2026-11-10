@@ -562,15 +562,18 @@ def test_nixl_platform_hooks_follow_kv_buffer_device(monkeypatch):
     from vllm_tt_plugin.platform import TTPlatform
 
     _device_buffer_config(monkeypatch, "cpu")
+    monkeypatch.setattr(kv_transfer, "_prepare_device_buffers", None)
     assert TTPlatform.get_nixl_supported_devices() == {"tt": ("cpu",)}
     assert TTPlatform.get_nixl_memory_type() is None
-    _device_buffer_config(monkeypatch, "tt")
+    # vLLM evaluates the device table at import, possibly before any config exists.
+    monkeypatch.setattr(kv_transfer, "_worker_config", None)
     prepared = []
     monkeypatch.setattr(
         kv_transfer, "_prepare_device_buffers", lambda: prepared.append(1) or True
     )
     assert TTPlatform.get_nixl_supported_devices() == {"tt": ("cpu", "tt")}
     assert prepared == [1]
+    _device_buffer_config(monkeypatch, "tt")
     assert TTPlatform.get_nixl_memory_type() == "VRAM"
     # Backend not findable: "tt" is not offered, so vLLM refuses the config up front.
     monkeypatch.setattr(kv_transfer, "_prepare_device_buffers", lambda: False)

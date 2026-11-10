@@ -1747,15 +1747,15 @@ class TTPlatform(Platform):
 
     @classmethod
     def get_nixl_supported_devices(cls) -> dict[str, tuple[str, ...]]:
-        # "tt": device KV buffers, carried by tt-kv's TT NIXL backend. NIXL agents are
-        # created right after this check, so the backend is made findable here.
+        # "tt": device KV buffers, carried by tt-kv's TT NIXL backend, offered whenever
+        # that backend can be made findable (done here, before any NIXL agent exists).
+        # vLLM reads this once, when its NIXL utils module is imported, which can be
+        # before the worker has a config: kv_buffer_device itself makes the choice.
         from vllm_tt_plugin import kv_transfer
 
-        devices: tuple[str, ...] = ("cpu",)
-        if kv_transfer.device_buffers_requested(kv_transfer.current_vllm_config()):
-            if kv_transfer.prepare_device_buffers():
-                devices = ("cpu", "tt")
-        return {"tt": devices}
+        if kv_transfer.prepare_device_buffers():
+            return {"tt": ("cpu", "tt")}
+        return {"tt": ("cpu",)}
 
     @classmethod
     def get_nixl_memory_type(cls) -> str | None:
