@@ -660,6 +660,10 @@ class TTWorker(WorkerBase):
         best-effort backstop and deliberately does not call it; see the note
         there.
         """
+        try:
+            kv_transfer.shutdown()
+        except Exception:
+            logger.exception("KV transfer shutdown failed; closing the mesh anyway")
         if getattr(self, "model_runner", None) is not None:
             try:
                 self.model_runner.shutdown()

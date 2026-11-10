@@ -333,6 +333,20 @@ def register_device_caches(
     connector.set_host_xfer_buffer_ops(_copy_op)
 
 
+def shutdown() -> None:
+    """Before the model and the mesh go: the connector (and its NIXL agents) first, as
+    vLLM's GPU worker does, then the copy op or device-buffer handle, whose device
+    programs must stop before the mesh closes (optional protocol: ``close()``)."""
+    global _copy_op
+    from vllm.distributed.kv_transfer import kv_transfer_state
+
+    kv_transfer_state.ensure_kv_transfer_shutdown()
+    op, _copy_op = _copy_op, None
+    close = getattr(op, "close", None)
+    if close is not None:
+        close()
+
+
 def kv_transfer_compat_factors() -> dict[str, str]:
     """Factors P and D must agree on beyond upstream's: the device cache layout the copy
     op moves. Empty before the copy op exists or if it does not describe its layout."""

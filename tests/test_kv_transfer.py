@@ -578,3 +578,21 @@ def test_nixl_platform_hooks_follow_kv_buffer_device(monkeypatch):
     # Backend not findable: "tt" is not offered, so vLLM refuses the config up front.
     monkeypatch.setattr(kv_transfer, "_prepare_device_buffers", lambda: False)
     assert TTPlatform.get_nixl_supported_devices() == {"tt": ("cpu",)}
+
+
+def test_shutdown_stops_the_connector_before_closing_the_handle(monkeypatch):
+    from vllm.distributed.kv_transfer import kv_transfer_state
+
+    order = []
+    monkeypatch.setattr(
+        kv_transfer_state,
+        "ensure_kv_transfer_shutdown",
+        lambda: order.append("connector"),
+    )
+    monkeypatch.setattr(
+        kv_transfer, "_copy_op", SimpleNamespace(close=lambda: order.append("handle"))
+    )
+    kv_transfer.shutdown()
+    assert order == ["connector", "handle"] and kv_transfer._copy_op is None
+    kv_transfer.shutdown()  # idempotent: nothing left to close
+    assert order == ["connector", "handle", "connector"]
