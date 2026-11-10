@@ -753,9 +753,16 @@ def _install_torch_accelerator_cleanup_patch() -> None:
 
     @wraps(original)
     def empty_cache():
-        if torch.accelerator.is_available():
-            return original()
-        return None
+        if not torch.accelerator.is_available():
+            return None
+        # A torch PrivateUse1 backend registered under TT's device type (a KV connector
+        # whose buffers live on the device registers one so vLLM can name them) has no
+        # caching allocator, and torch asserts in empty_cache(). Its tensors hold no
+        # torch storage, so there is nothing to release.
+        accelerator = torch.accelerator.current_accelerator()
+        if accelerator is not None and accelerator.type == TTPlatform.device_type:
+            return None
+        return original()
 
     empty_cache._tt_availability_guard = True
     torch.accelerator.empty_cache = empty_cache
