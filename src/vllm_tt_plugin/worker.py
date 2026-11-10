@@ -553,6 +553,8 @@ class TTWorker(WorkerBase):
         if kv_transfer.kv_transfer_enabled(self.vllm_config):
             from vllm.distributed.kv_transfer import ensure_kv_transfer_initialized
 
+            kv_transfer.note_vllm_config(self.vllm_config)
+
             ensure_kv_transfer_initialized(self.vllm_config, kv_cache_config)
         self.model_runner.initialize_kv_cache(kv_cache_config)
         if kv_transfer.kv_transfer_enabled(self.vllm_config):

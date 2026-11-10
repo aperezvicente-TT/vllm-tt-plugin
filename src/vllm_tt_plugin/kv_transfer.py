@@ -77,6 +77,56 @@ def register_copy_op_provider(
     _wire_layouts = tuple(wire_layouts)
 
 
+# kv_buffer_device="tt": a provider (registered by the tt-kv package) that turns the model's
+# device caches into tensors a connector registers as device memory, and makes the NIXL
+# backend that carries them findable.
+_device_buffer_provider: Callable[..., Any] | None = None
+_prepare_device_buffers: Callable[[], bool] | None = None
+
+
+def register_device_buffer_provider(
+    provider: Callable[..., Any], prepare: Callable[[], bool]
+) -> None:
+    """`provider(mesh_device, device_caches, kv_cache_config, kv_transfer_config,
+    device_index)` returns a handle with `caches` (per-layer tensors on device `tt` whose
+    data_ptr() a NIXL backend resolves to the device cache) and `wait_saves()` (the
+    forward that wrote the blocks has completed), or None. `prepare()` makes the backend
+    findable before NIXL agents are created."""
+    global _device_buffer_provider, _prepare_device_buffers
+    _device_buffer_provider = provider
+    _prepare_device_buffers = prepare
+
+
+_worker_config: VllmConfig | None = None
+
+
+def note_vllm_config(vllm_config: VllmConfig) -> None:
+    """The worker's config, for platform hooks vLLM calls without one (NIXL's device
+    checks run while the connector is built, outside any current-config context)."""
+    global _worker_config
+    _worker_config = vllm_config
+
+
+def current_vllm_config() -> VllmConfig | None:
+    if _worker_config is not None:
+        return _worker_config
+    from vllm.config import get_current_vllm_config
+
+    try:
+        return get_current_vllm_config()
+    except AssertionError:  # no config set in this context
+        return None
+
+
+def device_buffers_requested(vllm_config: VllmConfig | None) -> bool:
+    cfg = getattr(vllm_config, "kv_transfer_config", None)
+    return getattr(cfg, "kv_buffer_device", None) == "tt"
+
+
+def prepare_device_buffers() -> bool:
+    return _prepare_device_buffers is not None and bool(_prepare_device_buffers())
+
+
 def kv_transfer_enabled(vllm_config: VllmConfig) -> bool:
     return getattr(vllm_config, "kv_transfer_config", None) is not None
 
@@ -237,6 +287,31 @@ def register_device_caches(
     if not has_kv_transfer_group():
         return
     connector = get_kv_transfer_group()
+    global _copy_op
+    vllm_config = current_vllm_config()
+    if device_buffers_requested(vllm_config):
+        # The connector moves device KV itself (no host buffers, no copy op). The handle's
+        # wait_saves() stands in for the saves: an output that can finish a request is
+        # returned only after the forward that wrote its blocks completed, since the peer
+        # may read them as soon as the request is reported finished.
+        handle = None
+        if _device_buffer_provider is not None:
+            index = vllm_config.parallel_config.data_parallel_rank_local or 0
+            handle = _device_buffer_provider(
+                mesh_device,
+                device_caches,
+                kv_cache_config,
+                vllm_config.kv_transfer_config,
+                index,
+            )
+        if handle is None:
+            raise RuntimeError(
+                'kv_buffer_device="tt" needs the tt-kv package and its NIXL backend, with '
+                '"TT" among the connector\'s backends'
+            )
+        _copy_op = handle
+        connector.register_kv_caches(handle.caches)
+        return
     if _copy_op_provider is None:
         raise RuntimeError(
             "A KV connector is configured but no TT copy-op provider is registered; "
@@ -245,7 +320,6 @@ def register_device_caches(
     # The copy op first: connectors may compute their P/D compatibility check while
     # registering caches, and the copy op's layout is part of it (see
     # kv_transfer_compat_factors).
-    global _copy_op
     if wire_layout is not None:
         _copy_op = _copy_op_provider(
             mesh_device, device_caches, kv_cache_config, wire_layout=wire_layout

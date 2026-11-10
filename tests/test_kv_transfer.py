@@ -497,3 +497,81 @@ def test_wire_layout_reaches_the_provider(monkeypatch):
     kv_transfer.register_device_caches(None, {}, cfg)
     kv_transfer.register_device_caches(None, {}, cfg, wire_layout="LBHNC")
     assert calls == [{}, {"wire_layout": "LBHNC"}]
+
+
+def _device_buffer_config(monkeypatch, kv_buffer_device):
+    cfg = SimpleNamespace(
+        kv_transfer_config=SimpleNamespace(kv_buffer_device=kv_buffer_device),
+        parallel_config=SimpleNamespace(data_parallel_rank_local=None),
+    )
+    monkeypatch.setattr(kv_transfer, "_worker_config", cfg)
+    return cfg
+
+
+def test_device_buffers_registered_without_host_ops(monkeypatch):
+    """kv_buffer_device="tt": the connector registers the provider's device tensors, gets
+    no host-buffer ops, and wait_saves() reaches the handle (the forward fence)."""
+    calls = []
+
+    class Conn:
+        def register_kv_caches(self, caches):
+            calls.append(("register", caches))
+
+        def set_host_xfer_buffer_ops(self, op):
+            calls.append(("ops", op))
+
+    class Handle:
+        caches = {"l0": "device tensor"}
+
+        def wait_saves(self):
+            calls.append(("fence",))
+
+    import vllm.distributed.kv_transfer as kvt
+
+    vcfg = _device_buffer_config(monkeypatch, "tt")
+    monkeypatch.setattr(kvt, "has_kv_transfer_group", lambda: True)
+    monkeypatch.setattr(kvt, "get_kv_transfer_group", lambda: Conn())
+    monkeypatch.setattr(kv_transfer, "_copy_op", None)
+    seen = []
+
+    def provider(mesh, caches, kv_cfg, ktc, index):
+        seen.append((ktc, index))
+        return Handle()
+
+    monkeypatch.setattr(kv_transfer, "_device_buffer_provider", provider)
+    kv_transfer.register_device_caches(None, {}, "KVCFG")
+    assert calls == [("register", {"l0": "device tensor"})]
+    assert seen == [(vcfg.kv_transfer_config, 0)]
+    kv_transfer.wait_saves()
+    assert calls[-1] == ("fence",)
+
+
+def test_device_buffers_without_provider_refused(monkeypatch):
+    import pytest
+    import vllm.distributed.kv_transfer as kvt
+
+    _device_buffer_config(monkeypatch, "tt")
+    monkeypatch.setattr(kvt, "has_kv_transfer_group", lambda: True)
+    monkeypatch.setattr(kvt, "get_kv_transfer_group", lambda: object())
+    monkeypatch.setattr(kv_transfer, "_device_buffer_provider", None)
+    with pytest.raises(RuntimeError, match="tt-kv"):
+        kv_transfer.register_device_caches(None, {}, "KVCFG")
+
+
+def test_nixl_platform_hooks_follow_kv_buffer_device(monkeypatch):
+    from vllm_tt_plugin.platform import TTPlatform
+
+    _device_buffer_config(monkeypatch, "cpu")
+    assert TTPlatform.get_nixl_supported_devices() == {"tt": ("cpu",)}
+    assert TTPlatform.get_nixl_memory_type() is None
+    _device_buffer_config(monkeypatch, "tt")
+    prepared = []
+    monkeypatch.setattr(
+        kv_transfer, "_prepare_device_buffers", lambda: prepared.append(1) or True
+    )
+    assert TTPlatform.get_nixl_supported_devices() == {"tt": ("cpu", "tt")}
+    assert prepared == [1]
+    assert TTPlatform.get_nixl_memory_type() == "VRAM"
+    # Backend not findable: "tt" is not offered, so vLLM refuses the config up front.
+    monkeypatch.setattr(kv_transfer, "_prepare_device_buffers", lambda: False)
+    assert TTPlatform.get_nixl_supported_devices() == {"tt": ("cpu",)}

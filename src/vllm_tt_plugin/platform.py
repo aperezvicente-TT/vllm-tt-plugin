@@ -1747,8 +1747,24 @@ class TTPlatform(Platform):
 
     @classmethod
     def get_nixl_supported_devices(cls) -> dict[str, tuple[str, ...]]:
-        # Host-buffer mode only: NIXL cannot register TT device memory yet.
-        return {"tt": ("cpu",)}
+        # "tt": device KV buffers, carried by tt-kv's TT NIXL backend. NIXL agents are
+        # created right after this check, so the backend is made findable here.
+        from vllm_tt_plugin import kv_transfer
+
+        devices: tuple[str, ...] = ("cpu",)
+        if kv_transfer.device_buffers_requested(kv_transfer.current_vllm_config()):
+            if kv_transfer.prepare_device_buffers():
+                devices = ("cpu", "tt")
+        return {"tt": devices}
+
+    @classmethod
+    def get_nixl_memory_type(cls) -> str | None:
+        # Device buffers register as VRAM_SEG; host buffers keep upstream's DRAM default.
+        from vllm_tt_plugin import kv_transfer
+
+        if kv_transfer.device_buffers_requested(kv_transfer.current_vllm_config()):
+            return "VRAM"
+        return None
 
     @classmethod
     def alloc_kv_host_buffers(cls, shapes):
