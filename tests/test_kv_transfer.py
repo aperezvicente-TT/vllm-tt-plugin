@@ -596,3 +596,44 @@ def test_shutdown_stops_the_connector_before_closing_the_handle(monkeypatch):
     assert order == ["connector", "handle"] and kv_transfer._copy_op is None
     kv_transfer.shutdown()  # idempotent: nothing left to close
     assert order == ["connector", "handle", "connector"]
+
+
+def test_device_buffer_selftest_save_and_load(monkeypatch):
+    calls = []
+    op = SimpleNamespace(selftest=lambda kind, ids: calls.append((kind, list(ids))))
+    monkeypatch.setattr(kv_transfer, "_copy_op", op)
+    monkeypatch.setattr(kv_transfer, "_st_blocks", {})
+    monkeypatch.setattr(kv_transfer, "_st_recv", {})
+    new = [SimpleNamespace(req_id="a", block_ids=([4, 7],))]
+    cached = SimpleNamespace(req_ids=["a"], new_block_ids=[([9],)])
+    step = SimpleNamespace(
+        scheduled_new_reqs=new,
+        scheduled_cached_reqs=SimpleNamespace(req_ids=[], new_block_ids=[]),
+        kv_connector_metadata=SimpleNamespace(
+            reqs_to_send={},
+            reqs_to_recv={"b": SimpleNamespace(local_block_ids=([2, 5],))},
+        ),
+        finished_req_ids=set(),
+    )
+    kv_transfer.selftest_step(step)
+    step = SimpleNamespace(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=cached,
+        kv_connector_metadata=SimpleNamespace(reqs_to_send={}, reqs_to_recv={}),
+        finished_req_ids=set(),
+    )
+    kv_transfer.selftest_step(step)
+    step = SimpleNamespace(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=SimpleNamespace(req_ids=[], new_block_ids=[]),
+        kv_connector_metadata=SimpleNamespace(reqs_to_send={"a": 1.0}, reqs_to_recv={}),
+        finished_req_ids={"a"},
+    )
+    kv_transfer.selftest_step(step)
+    assert calls == [("save", [4, 7, 9])] and "a" not in kv_transfer._st_blocks
+    kv_transfer._st_recv["c"] = [6]
+    kv_transfer._selftest_received(
+        SimpleNamespace(finished_recving={"b", "c"}, invalid_block_ids={6})
+    )
+    assert calls[-1] == ("load", [2, 5]) and len(calls) == 2  # c failed: not checked
+    assert not kv_transfer._st_recv

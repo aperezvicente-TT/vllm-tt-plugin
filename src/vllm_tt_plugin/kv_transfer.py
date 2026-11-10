@@ -476,6 +476,51 @@ def note_block_ids(scheduler_output) -> None:
                 note(getattr(m, "local_block_ids", None))
 
 
+# Device-buffer self test (optional protocol: the handle's ``selftest(kind, block_ids)``
+# reads blocks back from the device and logs one CRC per block). P checks a request's
+# blocks when the connector offers them to D, D the blocks it received, once received.
+_st_blocks: dict[str, list[int]] = {}
+_st_recv: dict[str, list[int]] = {}
+
+
+def _first_group(ids) -> list[int]:
+    if ids and isinstance(ids[0], (list, tuple)):
+        return list(ids[0])
+    return list(ids or ())
+
+
+def selftest_step(scheduler_output) -> None:
+    op = _copy_op
+    if op is None or not hasattr(op, "selftest"):
+        return
+    for r in scheduler_output.scheduled_new_reqs:
+        _st_blocks[r.req_id] = _first_group(r.block_ids)
+    cached = scheduler_output.scheduled_cached_reqs
+    for req_id, ids in zip(cached.req_ids, cached.new_block_ids or ()):
+        if ids is not None:
+            _st_blocks.setdefault(req_id, []).extend(_first_group(ids))
+    meta = getattr(scheduler_output, "kv_connector_metadata", None)
+    for req_id in getattr(meta, "reqs_to_send", None) or {}:
+        if req_id in _st_blocks:
+            op.selftest("save", _st_blocks[req_id])
+    for req_id, m in (getattr(meta, "reqs_to_recv", None) or {}).items():
+        _st_recv[req_id] = _first_group(getattr(m, "local_block_ids", None))
+    for req_id in scheduler_output.finished_req_ids or ():
+        _st_blocks.pop(req_id, None)
+
+
+def _selftest_received(kv_output) -> None:
+    op = _copy_op
+    if kv_output is None or op is None or not hasattr(op, "selftest"):
+        return
+    # A failed receive is reported received with its blocks invalid (recomputed later).
+    invalid = set(getattr(kv_output, "invalid_block_ids", None) or ())
+    for req_id in kv_output.finished_recving or ():
+        ids = _st_recv.pop(req_id, None)
+        if ids and not invalid.intersection(ids):
+            op.selftest("load", ids)
+
+
 def wait_saves_of_freed(scheduler_output) -> None:
     """Before a step's loads and forward, wait for running saves of requests whose
     blocks were freed since the last step (finished early, aborted or preempted).
@@ -510,6 +555,7 @@ def gate_received(kv_output) -> None:
     waiting for remote KV in the scheduler, and other requests keep running) and
     released in a later step.
     """
+    _selftest_received(kv_output)
     op = _copy_op
     if kv_output is None or op is None or not hasattr(op, "take_load_ticket"):
         return
