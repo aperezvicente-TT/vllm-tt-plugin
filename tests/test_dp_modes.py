@@ -389,6 +389,7 @@ class TestDPModes:
 
         mesh_device = object()
         TTPlatform.set_device(None)
+        TTPlatform.set_device(0)  # a device index from vLLM's helper threads
         TTPlatform.set_device(mesh_device)
 
         assert assigned_devices == [mesh_device]

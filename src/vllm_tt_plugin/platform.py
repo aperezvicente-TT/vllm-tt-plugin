@@ -1842,7 +1842,10 @@ class TTPlatform(Platform):
 
     @classmethod
     def set_device(cls, device) -> None:
-        if device is None:
+        # vLLM also calls this with a device index (an int) from helper threads that
+        # need a current device for CUDA, e.g. NixlConnector's handshake thread when KV
+        # buffers live on the device. TT has no per-thread current device to select.
+        if device is None or isinstance(device, int):
             return
 
         import ttnn
