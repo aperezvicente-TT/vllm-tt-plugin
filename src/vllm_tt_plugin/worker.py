@@ -314,6 +314,9 @@ class TTWorker(WorkerBase):
             self.trace_mode,
             local_dp_rank,
             model_fabric_config=model_capabilities.get("fabric_config"),
+            fabric_override=lambda n: kv_transfer.fabric_config_override(
+                self.vllm_config, n
+            ),
             **(
                 {"num_command_queues": n}
                 if (n := kv_transfer.num_command_queues(self.vllm_config)) > 1
@@ -1126,8 +1129,17 @@ def get_reliability_mode(tt_config):
     return reliability_mode
 
 
-def set_fabric(tt_config, num_devices, model_fabric_config=None):
-    """Apply hardware defaults, model defaults, then explicit launch overrides."""
+def set_fabric(tt_config, num_devices, model_fabric_config=None, fabric_override=None):
+    """Apply hardware defaults, model defaults, then explicit launch overrides. A KV
+    transfer provider's override (kv_transfer.register_fabric_config_provider) wins."""
+    override = fabric_override(num_devices) if fabric_override else None
+    if override is not None:
+        args, kwargs = override
+        logger.info(
+            "Setting fabric config from the KV transfer provider: %s %s", args, kwargs
+        )
+        ttnn.set_fabric_config(*args, **kwargs)
+        return
     if num_devices == 1:
         return
 
@@ -1231,6 +1243,7 @@ def open_mesh_device(
     local_dp_rank=0,
     *,
     model_fabric_config=None,
+    fabric_override=None,
     num_command_queues=1,
 ):
     mesh_grid = get_mesh_grid()
@@ -1241,7 +1254,9 @@ def open_mesh_device(
     num_devices_requested = mesh_grid[0] * mesh_grid[1]
     with _device_open_lock():
         # Set fabric before opening the device
-        set_fabric(tt_config, num_devices_requested, model_fabric_config)
+        set_fabric(
+            tt_config, num_devices_requested, model_fabric_config, fabric_override
+        )
 
         mesh_device = ttnn.open_mesh_device(
             ttnn.MeshShape(*mesh_grid),

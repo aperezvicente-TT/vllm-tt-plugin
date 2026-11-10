@@ -437,8 +437,16 @@ class TestDPModes:
         steps: list[str] = []
         fabric_config = (model_capabilities or {}).get("fabric_config")
 
-        def open_mesh(_tt_config, _trace_mode, _local_dp_rank, *, model_fabric_config):
+        def open_mesh(
+            _tt_config,
+            _trace_mode,
+            _local_dp_rank,
+            *,
+            model_fabric_config,
+            fabric_override,
+        ):
             assert model_fabric_config is fabric_config
+            assert fabric_override(1) is None  # no KV transfer configured
             steps.append("mesh")
             return mesh_device
 

@@ -158,3 +158,28 @@ def test_fabric_and_mesh_open_hold_the_host_device_lock(monkeypatch, fabric, tmp
     with pytest.raises(RuntimeError, match="flush timeout"):
         worker.open_mesh_device(None, "off")
     assert steps == ["lock", "fabric", "unlock"]
+
+
+def test_kv_transfer_provider_sets_fabric_even_for_one_device(fabric):
+    worker.set_fabric(None, 1, fabric_override=lambda n: (("DISABLED",), {"mode": n}))
+    assert fabric.call_args.args == ("DISABLED",)
+    assert fabric.call_args.kwargs == {"mode": 1}
+
+
+def test_kv_transfer_provider_none_keeps_the_plugin_choice(fabric):
+    worker.set_fabric(None, 1, fabric_override=lambda n: None)
+    fabric.assert_not_called()
+    worker.set_fabric(None, 4, fabric_override=lambda n: None)
+    assert fabric.call_args.kwargs["config"] == ttnn.FabricConfig.FABRIC_1D
+
+
+def test_fabric_override_needs_kv_transfer(monkeypatch):
+    from vllm_tt_plugin import kv_transfer
+
+    monkeypatch.setattr(kv_transfer, "_fabric_config_provider", lambda n: ("x", {}))
+    assert (
+        kv_transfer.fabric_config_override(SimpleNamespace(kv_transfer_config=None), 1)
+        is None
+    )
+    cfg = SimpleNamespace(kv_transfer_config=SimpleNamespace())
+    assert kv_transfer.fabric_config_override(cfg, 1) == ("x", {})

@@ -97,6 +97,25 @@ def register_device_buffer_provider(
     _prepare_device_buffers = prepare
 
 
+# A provider whose transfers use device fabric another process brought up (a fabric
+# island) decides the fabric config of the KV-transfer worker's mesh.
+_fabric_config_provider: Callable[[int], Any] | None = None
+
+
+def register_fabric_config_provider(provider: Callable[[int], Any]) -> None:
+    """`provider(num_devices)` returns `(args, kwargs)` for `ttnn.set_fabric_config`, or
+    None to keep the plugin's choice. Called before the mesh opens, also for a
+    single-device mesh, and only when KV transfer is configured."""
+    global _fabric_config_provider
+    _fabric_config_provider = provider
+
+
+def fabric_config_override(vllm_config: VllmConfig, num_devices: int) -> Any:
+    if _fabric_config_provider is None or not kv_transfer_enabled(vllm_config):
+        return None
+    return _fabric_config_provider(num_devices)
+
+
 _worker_config: VllmConfig | None = None
 
 
