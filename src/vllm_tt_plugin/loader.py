@@ -46,6 +46,7 @@ class TTModelLoader(BaseModelLoader):
             tt_data_parallel=tt_data_parallel,
             optimizations=optimizations,
             **_construction_kv_cache_dtype(model_class, vllm_config),
+            **_construction_rope_layout(model_class, vllm_config),
         )
         return model
 
@@ -71,3 +72,20 @@ def _construction_kv_cache_dtype(model_class, vllm_config: VllmConfig) -> dict:
         return {}
     params = inspect.signature(model_class.initialize_vllm_model).parameters
     return {"kv_cache_dtype": dtype} if "kv_cache_dtype" in params else {}
+
+
+def _construction_rope_layout(model_class, vllm_config: VllmConfig) -> dict:
+    """``use_hf_rope=True`` for a model that declares ``supports_hf_rope_kv`` when a KV
+    connector is configured.
+
+    The model then keeps K in the checkpoint's (Hugging Face, rotate-half) RoPE
+    channel order, as vLLM's other platforms do, so the KV it writes means the same
+    as theirs when a connector moves it to another platform. Without a connector the
+    model keeps its own order.
+    """
+    capabilities = getattr(model_class, "model_capabilities", None) or {}
+    if not capabilities.get("supports_hf_rope_kv"):
+        return {}
+    if getattr(vllm_config, "kv_transfer_config", None) is None:
+        return {}
+    return {"use_hf_rope": True}
