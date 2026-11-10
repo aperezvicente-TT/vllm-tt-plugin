@@ -373,6 +373,25 @@ def _scheduled_progress(scheduler_output):
         yield req_id, computed, n.get(req_id, 0)
 
 
+def mark_written_blocks(scheduler_output, runner) -> None:
+    """After a step's forward is enqueued and before the connector's save point: tell
+    the device-buffer handle which blocks the step writes (optional protocol:
+    ``mark_step(blocks)``, tt-kv spec 12 §9.13). A NIC push of those blocks posted after
+    this waits for exactly this step; blocks no outstanding step writes go at once."""
+    mark = getattr(_copy_op, "mark_step", None)
+    if mark is None:
+        return
+    requests, block_size = runner.requests, runner.cache_config.block_size
+    blocks: list[int] = []
+    for req_id, computed, scheduled in _scheduled_progress(scheduler_output):
+        state = requests.get(req_id)
+        if state is None or not scheduled:
+            continue
+        ids = state.block_ids[0]
+        blocks.extend(ids[computed // block_size : -(-(computed + scheduled) // block_size)])
+    mark(blocks)
+
+
 def output_needs_saves(
     scheduler_output, num_prompt_tokens: Callable[[str], int | None]
 ) -> bool:

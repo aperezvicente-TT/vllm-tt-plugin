@@ -575,3 +575,24 @@ def test_nixl_platform_hooks_follow_kv_buffer_device(monkeypatch):
     # Backend not findable: "tt" is not offered, so vLLM refuses the config up front.
     monkeypatch.setattr(kv_transfer, "_prepare_device_buffers", lambda: False)
     assert TTPlatform.get_nixl_supported_devices() == {"tt": ("cpu",)}
+
+
+def test_written_blocks_are_marked_per_step(monkeypatch):
+    """Device buffers (tt-kv spec 12 §9.13): after the forward, the handle learns which
+    blocks the step writes, so a NIC push of them waits for exactly this step."""
+    marks = []
+    monkeypatch.setattr(kv_transfer, "_copy_op", SimpleNamespace(mark_step=marks.append))
+    runner = SimpleNamespace(
+        requests={
+            "a": SimpleNamespace(block_ids=([10, 11, 12, 13, 14],)),
+            "b": SimpleNamespace(block_ids=([20, 21],)),
+        },
+        cache_config=SimpleNamespace(block_size=16),
+    )
+    # a: tokens 16..47 (blocks 1-2); b: tokens 0..16 (blocks 0-1, the second partly).
+    kv_transfer.mark_written_blocks(sched(new=[("b", 0, 17)], cached=[("a", 16, 32)]), runner)
+    assert marks == [[20, 21, 11, 12]]
+    # A copy op without the protocol (host buffers) is left alone.
+    monkeypatch.setattr(kv_transfer, "_copy_op", SimpleNamespace())
+    kv_transfer.mark_written_blocks(sched(new=[("b", 0, 17)]), runner)
+    assert marks == [[20, 21, 11, 12]]
