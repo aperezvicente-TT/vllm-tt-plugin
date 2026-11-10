@@ -38,6 +38,23 @@ def test_availability_guard_delegates_and_is_idempotent(
     assert calls == (["cache"] if available else [])
 
 
+def test_guard_skips_a_tt_privateuse1_accelerator(monkeypatch, active_tt):
+    calls = []
+    monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: calls.append("cache"))
+    monkeypatch.setattr(torch.accelerator, "is_available", lambda: True)
+    monkeypatch.setattr(
+        torch.accelerator, "current_accelerator", lambda: SimpleNamespace(type="cuda")
+    )
+    platform._install_torch_accelerator_cleanup_patch()
+    torch.accelerator.empty_cache()
+    assert calls == ["cache"]
+    monkeypatch.setattr(
+        torch.accelerator, "current_accelerator", lambda: SimpleNamespace(type="tt")
+    )
+    assert torch.accelerator.empty_cache() is None
+    assert calls == ["cache"]
+
+
 @pytest.mark.parametrize("failure", ["availability", "cache"])
 def test_accelerator_failures_propagate(monkeypatch, active_tt, failure):
     error = RuntimeError(failure)
