@@ -135,7 +135,9 @@ Sources: [platform.py](../src/vllm_tt_plugin/platform.py),
 |---|---|---|
 | `fabric_config` | `None` | Supplies a dictionary of keyword arguments to `ttnn.set_fabric_config`, using TTNN enum and configuration objects. `set_fabric` merges hardware defaults, then model defaults, then explicit `tt.fabric_config` and `tt.fabric_reliability_mode` launch overrides. `set_fabric` does nothing for a single-device mesh. The plugin forwards the merged dictionary to TTNN; the model declaration is not the string accepted by the operator's `tt.fabric_config` setting. |
 
-Sources: [worker.py](../src/vllm_tt_plugin/worker.py) and the
+| `supports_hf_rope_kv` | `False` | Declares that `initialize_vllm_model` accepts `use_hf_rope`: with `True`, the model keeps K in the checkpoint's Hugging Face (rotate-half) RoPE channel order, the order vLLM's other platforms use. `TTModelLoader.load_model` passes `use_hf_rope=True` only when a KV connector is configured (`--kv-transfer-config`), so KV moved to or from another platform means the same there. Without a connector the model keeps its own order. |
+
+Sources: [worker.py](../src/vllm_tt_plugin/worker.py), [loader.py](../src/vllm_tt_plugin/loader.py) and the
 [README fabric configuration example](../README.md#model-fabric-configuration).
 
 ## Pipeline-stage capability

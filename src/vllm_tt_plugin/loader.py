@@ -42,6 +42,7 @@ class TTModelLoader(BaseModelLoader):
             max_seq_len=model_config.max_model_len,
             tt_data_parallel=tt_data_parallel,
             optimizations=optimizations,
+            **_construction_rope_layout(model_class, vllm_config),
         )
         return model
 
@@ -53,3 +54,20 @@ class TTModelLoader(BaseModelLoader):
         """Load weights into a model. This standalone API allows
         inplace weights loading for an already-initialized model"""
         raise NotImplementedError
+
+
+def _construction_rope_layout(model_class, vllm_config: VllmConfig) -> dict:
+    """``use_hf_rope=True`` for a model that declares ``supports_hf_rope_kv`` when a KV
+    connector is configured.
+
+    The model then keeps K in the checkpoint's (Hugging Face, rotate-half) RoPE
+    channel order, as vLLM's other platforms do, so the KV it writes means the same
+    as theirs when a connector moves it to another platform. Without a connector the
+    model keeps its own order.
+    """
+    capabilities = getattr(model_class, "model_capabilities", None) or {}
+    if not capabilities.get("supports_hf_rope_kv"):
+        return {}
+    if getattr(vllm_config, "kv_transfer_config", None) is None:
+        return {}
+    return {"use_hf_rope": True}
