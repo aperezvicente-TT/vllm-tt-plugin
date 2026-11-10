@@ -3359,6 +3359,9 @@ class TTModelRunner:
                 ret = TTModelRunner._execute_model_body(self, scheduler_output)
             finally:
                 self._in_kv_step = False
+            # Before the connector's save point (this block's exit): pushes posted
+            # there wait for the step that writes their blocks.
+            kv_transfer.mark_written_blocks(scheduler_output, self)
         kv_transfer.gate_received(kv_output)
         if ret is EMPTY_MODEL_RUNNER_OUTPUT:
             kv_transfer.wait_saves()

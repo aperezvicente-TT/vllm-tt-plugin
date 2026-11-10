@@ -1767,6 +1767,14 @@ class TTPlatform(Platform):
         return None
 
     @classmethod
+    def nixl_device_writes_ordered(cls) -> bool:
+        # Proposed hook (lab vLLM tt-kv/vllm-0.31-nic-stream): tt-kv's TT backend holds a
+        # push of device KV until the step that writes its blocks has (tt-kv spec 12 §9.13).
+        from vllm_tt_plugin import kv_transfer
+
+        return kv_transfer.device_buffers_requested(kv_transfer.current_vllm_config())
+
+    @classmethod
     def alloc_kv_host_buffers(cls, shapes):
         # Upstream hook (proposed): the NIXL connector's host transfer buffers.
         from vllm_tt_plugin import host_buffers

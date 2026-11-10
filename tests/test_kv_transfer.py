@@ -637,3 +637,28 @@ def test_device_buffer_selftest_save_and_load(monkeypatch):
     )
     assert calls[-1] == ("load", [2, 5]) and len(calls) == 2  # c failed: not checked
     assert not kv_transfer._st_recv
+
+
+def test_written_blocks_are_marked_per_step(monkeypatch):
+    """Device buffers (tt-kv spec 12 §9.13): after the forward, the handle learns which
+    blocks the step writes, so a NIC push of them waits for exactly this step."""
+    marks = []
+    monkeypatch.setattr(
+        kv_transfer, "_copy_op", SimpleNamespace(mark_step=marks.append)
+    )
+    runner = SimpleNamespace(
+        requests={
+            "a": SimpleNamespace(block_ids=([10, 11, 12, 13, 14],)),
+            "b": SimpleNamespace(block_ids=([20, 21],)),
+        },
+        cache_config=SimpleNamespace(block_size=16),
+    )
+    # a: tokens 16..47 (blocks 1-2); b: tokens 0..16 (blocks 0-1, the second partly).
+    kv_transfer.mark_written_blocks(
+        sched(new=[("b", 0, 17)], cached=[("a", 16, 32)]), runner
+    )
+    assert marks == [[20, 21, 11, 12]]
+    # A copy op without the protocol (host buffers) is left alone.
+    monkeypatch.setattr(kv_transfer, "_copy_op", SimpleNamespace())
+    kv_transfer.mark_written_blocks(sched(new=[("b", 0, 17)]), runner)
+    assert marks == [[20, 21, 11, 12]]
