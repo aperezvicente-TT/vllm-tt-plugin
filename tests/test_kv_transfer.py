@@ -497,3 +497,16 @@ def test_wire_layout_reaches_the_provider(monkeypatch):
     kv_transfer.register_device_caches(None, {}, cfg)
     kv_transfer.register_device_caches(None, {}, cfg, wire_layout="LBHNC")
     assert calls == [{}, {"wire_layout": "LBHNC"}]
+
+
+def test_layer_names_match_vllms_attention_layers():
+    # NixlConnector requires both sides of a transfer to name the same caches.
+    cfg = SimpleNamespace(
+        model_config=SimpleNamespace(
+            get_num_layers_by_block_type=lambda parallel, kind: 3
+        ),
+        parallel_config=None,
+    )
+    assert kv_transfer.layer_names(cfg) == [
+        f"model.layers.{i}.self_attn.attn" for i in range(3)
+    ]
