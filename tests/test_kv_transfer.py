@@ -662,3 +662,16 @@ def test_written_blocks_are_marked_per_step(monkeypatch):
     monkeypatch.setattr(kv_transfer, "_copy_op", SimpleNamespace())
     kv_transfer.mark_written_blocks(sched(new=[("b", 0, 17)]), runner)
     assert marks == [[20, 21, 11, 12]]
+
+
+def test_layer_names_match_vllms_attention_layers():
+    # NixlConnector requires both sides of a transfer to name the same caches.
+    cfg = SimpleNamespace(
+        model_config=SimpleNamespace(
+            get_num_layers_by_block_type=lambda parallel, kind: 3
+        ),
+        parallel_config=None,
+    )
+    assert kv_transfer.layer_names(cfg) == [
+        f"model.layers.{i}.self_attn.attn" for i in range(3)
+    ]

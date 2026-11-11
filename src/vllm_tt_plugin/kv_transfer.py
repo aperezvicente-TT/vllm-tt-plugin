@@ -179,11 +179,15 @@ def supported_kv_cache_layouts(vllm_config: VllmConfig) -> list[str]:
 
 def layer_names(vllm_config: VllmConfig) -> list[str]:
     """One vLLM layer name per decoder layer, in the order the model allocates its
-    caches."""
+    caches.
+
+    The names are those of vLLM's own attention layers (``<attention module>.attn``):
+    NixlConnector compares the peer's region names with its own at handshake, so a
+    TT worker pairs with a GPU or CPU worker only under the same names."""
     n = vllm_config.model_config.get_num_layers_by_block_type(
         vllm_config.parallel_config, "attention"
     )
-    return [f"model.layers.{i}.self_attn" for i in range(n)]
+    return [f"model.layers.{i}.self_attn.attn" for i in range(n)]
 
 
 def shadow_kv_caches(kv_cache_config: KVCacheConfig) -> dict[str, torch.Tensor]:
